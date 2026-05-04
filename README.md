@@ -1,17 +1,13 @@
-# SDS Source Detection
+# SDS Source Detection 
 
-Code for the master's thesis on detecting Sand and Dust Storm (SDS) sources from
-reanalysis and satellite data, using a back-tracking pipeline followed by a
-Random Forest / MLP classifier.
-
+Code for the master thesis "Identifying Sand and Dust Storm Source Regions Through Spatiotemporal Backtracking for Machine Learning-Based Modelling". The repo contains all  the data preprocessing, backtracking and ML code. 
 The full workflow has four stages, run roughly in this order:
 
 ```
 download  →  preprocess  →  backtrace  →  hpc (train + analyse)
 ```
 
-The download and preprocessing stages run on a local workstation; training and
-analysis run on the HPC cluster.
+The download and preprocessing stages run on a local workstation; training is ideally run on a cluster.
 
 ## Repository layout
 
@@ -76,17 +72,17 @@ flags, e.g. `python preprocess_era5.py -r 6h -s 0.75`.
 ## Stage 3 — backtrace (`scripts/backtrace/`)
 
 Track aerosol plumes back to candidate sources from the merged ERA5+CAMS file.
-Both scripts accept many parameters and run a cartesian product of all values
+Both scripts accept parameters and run a cartesian product of all values
 passed (grid search). Outputs go to `data/backtrace_overlap_output/`.
 
 | Script                              | What it does                                                                                |
 | ----------------------------------- | ------------------------------------------------------------------------------------------- |
-| `backtrace_overlap_windshift.py`    | Step 1 — overlap-based plume tracking with wind advection.                                  |
-| `backtrace_intermediate_regions.py` | Step 2 — refines / filters source candidates with intermediate-region scoring + NDVI checks. |
+| `backtrace_overlap_windshift.py`    | Step 1 — trajectory building & genesis  detection                                  |
+| `backtrace_intermediate_regions.py` | Step 2 — intermediate source detection                                           |
 
 ## Stage 4 — HPC (`scripts/hpc/`)
 
-Training and analysis of the RF / MLP source-detection model. Paths and most
+Training and analysis of the RF source-detection model. Paths and most
 defaults live in `config.py`; every script accepts CLI overrides.
 
 Shared modules:
@@ -95,14 +91,14 @@ Shared modules:
 - `feature_names.py` — short → display name + units, plot-grouping definitions
 
 Feature assembly (run once per resolution before any training):
-- `prepare_features.py` — flatten ERA5 + NDVI + ACLED + soil into per-year flat NetCDFs in `data/processed/<ftag>/`. The RF / NN scripts read these via `FeatureCache`.
-
+- `prepare_features.py` — flatten ERA5 + NDVI + ACLED + soil into per-year flat NetCDFs in `data/processed/<ftag>/`.
+  
 Training + tuning:
 - `subsample_ratio_experiment.py` — sweep neg:pos ratio for the RF
-- `optimize_rf.py`                — Bayesian (Optuna) HPO over RF hyperparameters
-- `train_final_rf.py`             — final RF with the chosen HPO hyperparameters
+- `optimize_rf.py`                — Bayesian  HPO over RF hyperparameters
+- `train_final_rf.py`             — final RF with the chosen HPO hyperparameters (read from config.py)
 - `retrain_boundary.py`           — retrain on top of a saved RF, oversampling FP-prone (high base-prob) negatives to sharpen the decision boundary
-- `train_nn.py`                   — MLP baseline using the same data pipeline
+- `train_nn.py`                   — MLP baseline using the same data pipeline (need a separate venv, the conda environment doesnt contain pytorch)
 
 Analysis:
 - `analyze_rf_results.py`           — figures and metrics for a trained RF
