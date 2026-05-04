@@ -94,9 +94,14 @@ Shared modules:
 - `data_utils.py`    — `FeatureCache`, target/index builders, Platt scaling, metrics
 - `feature_names.py` — short → display name + units, plot-grouping definitions
 
-Training:
+Feature assembly (run once per resolution before any training):
+- `prepare_features.py` — flatten ERA5 + NDVI + ACLED + soil into per-year flat NetCDFs in `data/processed/<ftag>/`. The RF / NN scripts read these via `FeatureCache`.
+
+Training + tuning:
 - `subsample_ratio_experiment.py` — sweep neg:pos ratio for the RF
-- `train_final_rf.py`             — final RF with HPO hyperparameters
+- `optimize_rf.py`                — Bayesian (Optuna) HPO over RF hyperparameters
+- `train_final_rf.py`             — final RF with the chosen HPO hyperparameters
+- `retrain_boundary.py`           — retrain on top of a saved RF, oversampling FP-prone (high base-prob) negatives to sharpen the decision boundary
 - `train_nn.py`                   — MLP baseline using the same data pipeline
 
 Analysis:
@@ -153,7 +158,10 @@ python scripts/backtrace/backtrace_overlap_windshift.py
 python scripts/backtrace/backtrace_intermediate_regions.py
 
 # Stage 4 (on HPC)
+python scripts/hpc/prepare_features.py --years 2015 2016 2017 2018 2019 2020 2021 2022 2023 2024
+python scripts/hpc/optimize_rf.py                  # optional: HPO sweep
 python scripts/hpc/train_final_rf.py
+python scripts/hpc/retrain_boundary.py --model_dir models/<final_rf_run>   # optional refinement
 python scripts/hpc/analyze_rf_results.py
 # (then permutation/dropout/SHAP as needed)
 ```
