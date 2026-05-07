@@ -86,7 +86,7 @@ defaults live in `config.py`; every script accepts CLI overrides.
 
 Shared modules:
 - `config.py`        — paths, hyperparameters, sampling configs, feature drop list
-- `data_utils.py`    — `FeatureCache`, target/index builders, Platt scaling, metrics
+- `data_utils.py`    — data laoding helpers, target/index builders, Platt scaling, metrics
 - `feature_names.py` — short → display name + units, plot-grouping definitions
 
 Feature assembly (run once per resolution before any training):
@@ -153,7 +153,8 @@ python scripts/backtrace/backtrace_intermediate_regions.py
 
 # Stage 4 (on HPC)
 python scripts/hpc/prepare_features.py --years 2015 2016 2017 2018 2019 2020 2021 2022 2023 2024
-python scripts/hpc/optimize_rf.py                  # optional: HPO sweep
+python scripts/hpc/subsample_ratio_experiment.py  # optional: subsampling ratio sweep (currently best ratio is already saved in config.py for the final rf)
+python scripts/hpc/optimize_rf.py                  # optional: HPO sweep 
 python scripts/hpc/train_final_rf.py
 python scripts/hpc/retrain_boundary.py --model_dir models/<final_rf_run>   # optional refinement
 python scripts/hpc/analyze_rf_results.py
