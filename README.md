@@ -161,5 +161,5 @@ python scripts/hpc/analyze_rf_results.py
 # (then permutation/dropout/SHAP as needed)
 ```
 
-Resolutions other than the default work via `-r {1D,6h,3h}` and `-s {0.25,0.75}`
+Resolutions other than the default work via `-r {1D,6h}` and `-s {0.25,0.75}`
 on the preprocess + backtrace scripts.
