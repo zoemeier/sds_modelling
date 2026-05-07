@@ -65,7 +65,6 @@ flags, e.g. `python preprocess_era5.py -r 6h -s 0.75`.
 | `preprocess_cams.py`            | Resamples 3-hourly CAMS and regrids onto the target grid.                             |
 | `preprocess_ndvi.py`            | Quality-filters MODIS 500m, regrids to target grid, interpolates to target temporal freq. |
 | `preprocess_acled.py`           | Snaps events to the target grid, builds rolling-window counts (30/180/365d), log1p.    |
-| `soilgrids_to_netcdf.py`        | Converts the SoilGrids GeoTIFFs into one NetCDF with derived variables.               |
 | `regrid_soil.py`                | Conservative regridding of soil to the target grid.                                   |
 | `prepare_backtracking_data.py`  | Merges ERA5 wind + CAMS aerosol + derived wind speed into the backtracing input file. |
 
@@ -144,7 +143,6 @@ python scripts/download/download_acled.py
 python scripts/preprocess/preprocess_era5.py
 python scripts/preprocess/preprocess_cams.py
 python scripts/preprocess/preprocess_ndvi.py
-python scripts/preprocess/soilgrids_to_netcdf.py
 python scripts/preprocess/regrid_soil.py
 python scripts/preprocess/preprocess_acled.py
 python scripts/preprocess/prepare_backtracking_data.py
