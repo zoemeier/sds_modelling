@@ -42,7 +42,7 @@ missing.
 
 | Script                  | What it does                                                          |
 | ----------------------- | --------------------------------------------------------------------- |
-| `request_ecmwf.py`      | Requests + downloads ERA5 (per variable, per year) and CAMS (per year) from CDS/ADS. |
+| `download_ecmwf.py`     | Requests + downloads ERA5 (per variable, per year) and CAMS (per year) from CDS/ADS. |
 | `request_ndvi.py`       | Submits AppEEARS area requests for MODIS NDVI, one task per year.     |
 | `download_ndvi.py`      | Downloads completed AppEEARS bundles (run after the email arrives).   |
 | `download_soilgrids.py` | Pulls SoilGrids 2.0 GeoTIFFs from the ISRIC WCS and combines them into one NetCDF. |
@@ -134,7 +134,7 @@ End-to-end (default daily, 0.25°):
 
 ```bash
 # Stage 1 — slow, resumable
-python scripts/download/request_ecmwf.py
+python scripts/download/download_ecmwf.py
 python scripts/download/request_ndvi.py        # then wait for email
 python scripts/download/download_ndvi.py
 python scripts/download/download_soilgrids.py

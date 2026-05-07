@@ -6,7 +6,7 @@ All arguments accept multiple values; the script runs every combination
 (cartesian product / grid search).
 
 Usage examples:
-  # Default single run (daily, 0.25°, duaod=0.2, angstr=0.8, pm10=1.5e-7)
+  # Default single run (daily, 0.25°, duaod=0.3, angstr=0.4, pm10=1.5e-7)
   python sds_windshift_tracker.py
 
   # Sweep Angstrom threshold (3 runs)
@@ -69,7 +69,7 @@ V_WIND_VAR = "v10"
 
 
 # =============================================================================
-# LOGGING HELPER — tee stdout to both terminal and a log file
+# LOGGING HELPER 
 # =============================================================================
 
 class TeeLogger:
