@@ -1,6 +1,6 @@
 # SDS Source Detection 
 
-Code for the master thesis "Identifying Sand and Dust Storm Source Regions Through Spatiotemporal Backtracking for Machine Learning-Based Modelling". The repo contains all  the data preprocessing, backtracking and ML code. 
+Code for the master thesis "Identifying Sand and Dust Storm Source Regions Through Spatiotemporal Backtracking for Machine Learning-Based Modelling". The repo contains all the data preprocessing, backtracking and ML code. 
 The full workflow has four stages, run roughly in this order:
 
 ```
