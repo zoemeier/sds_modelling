@@ -119,7 +119,7 @@ SDS_PATH = (
     DATA_PATH / "backtrace_overlap_output" / "combination_overlap"
     / "daily_025"
     / "04ae_03duaod_15en-8pm10_0px_025iou_0gap_0stub_0mem"
-    / "ndvidep_3to5wsmean_4to7wsmax_015ndvi_025snow_06aepx_upwindplume_k4_median_fbmedian_noduaod_002dae_novol_0clust"
+    / "ndvidep_3to5wsmean_4to7wsmax_015ndvi_025snow_upwindplume_k4_median_002dae_0clust"
     / "sds_sources_filtered.nc"
 )
 
@@ -143,7 +143,7 @@ HPO_N_STARTUP  = 15
 # Final RF
 # ---------------------------------------------------------------------------
 FINAL_RF = SamplingConfig(
-    neg_ratio=10,
+    neg_ratio=20,
     num_train_total_cap=0,
     num_train_pos_cap=0,
     val_test_total_cap=0,
@@ -178,7 +178,7 @@ FINAL_RF_PARAMS = dict(
     verbose=0,
 )
 
-FINAL_RF_TAG = "10sub_400est_25d_noelevation_hpo"
+FINAL_RF_TAG = "20sub_400est_25d_noelevation_hpo"
 
 
 # ---------------------------------------------------------------------------
