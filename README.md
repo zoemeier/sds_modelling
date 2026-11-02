@@ -37,7 +37,7 @@ python run.py analysis        # evaluation metrics and figures
 python run.py importance      # SHAP, permutation and dropout importance, feature correlations
 ```
 
-Each stage stops at the first error. Downloads, preprocessing and backtracking are
+Downloads, preprocessing and backtracking are
 resumable and skip existing outputs, except `request_ndvi.py`, which submits new NDVI
 requests every time it runs. `analysis` and `importance` use the most recent model in
 `models/` unless `--model_dir` is given; `--dry_run` lists the commands of a stage.
