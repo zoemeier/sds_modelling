@@ -30,11 +30,11 @@ The pipeline runs in stages:
 ```bash
 python run.py download        # ERA5, CAMS, SoilGrids, ACLED; submits the NDVI requests
 python run.py download_ndvi   # once the AppEEARS NDVI requests are complete
-python run.py preprocess
-python run.py backtracking
-python run.py train
-python run.py analysis
-python run.py importance
+python run.py preprocess      # regridding, aggregating and preprocessing
+python run.py backtracking    # track dust plumes, detect genesis and intermediate sources
+python run.py train           # build model features, train the random forest
+python run.py analysis        # evaluation metrics and figures
+python run.py importance      # SHAP, permutation and dropout importance, feature correlations
 ```
 
 Each stage stops at the first error. Downloads, preprocessing and backtracking are
