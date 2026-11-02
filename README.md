@@ -49,6 +49,7 @@ including the optional experiments that are not part of a stage: the subsampling
 sweep (`subsample_ratio_experiment.py`), hyperparameter optimisation (`optimize_rf.py`),
 boundary retraining (`retrain_boundary.py`) and the neural network baseline
 (`train_nn.py`, requires PyTorch).
+See [scripts/README.md](scripts/README.md) for the full list of steps.
 
 ## Configuration
 
