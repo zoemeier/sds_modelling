@@ -13,7 +13,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -24,12 +23,15 @@ from optuna.samplers import TPESampler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
-from config import (
-    LOGS_PATH, BAYESIAN_HPO, SUBSAMPLE_SWEEP,
-    RESOLUTION, SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
-    SDS_PATH, HPO_STUDY_NAME, HPO_N_TRIALS, HPO_N_STARTUP,
+from sds.config import (
+    VAL_CALIB_FRAC, HPO_SEARCH_SPACE, VAL_SPLIT_SEED, LOGS_PATH,
+    HPO_SAMPLING, SWEEP_SAMPLING, RESOLUTION, SPATIAL_RES,
+    TRAIN_YEARS, VAL_YEARS, TEST_YEARS, HPO_STUDY_NAME,
+    HPO_N_TRIALS, HPO_N_STARTUP,
 )
-from data_utils import (
+from sds.paths import resolve_path, project_relative, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     collect_indices, build_train_set, build_eval_set,
     platt_fit, platt_apply, compute_metrics, find_best_threshold,
@@ -70,22 +72,22 @@ def main():
     # Sampling config selector + overrides
     parser.add_argument("--config_name", type=str, default="bayesian_hpo",
                         choices=["bayesian_hpo", "subsample_sweep"],
-                        help="Which SamplingConfig to use from config.py")
+                        help="sampling settings: bayesian_hpo = HPO_SAMPLING, subsample_sweep = SWEEP_SAMPLING")
     parser.add_argument("--ratio", type=int, default=None,
                         help=f"Override neg:pos ratio "
-                             f"(default: {BAYESIAN_HPO.neg_ratio})")
+                             f"(default: {HPO_SAMPLING['neg_ratio']})")
     parser.add_argument("--pos_cap", type=int, default=None,
                         help=f"Override num_train_pos_cap "
-                             f"(default: {BAYESIAN_HPO.num_train_pos_cap})")
+                             f"(default: {HPO_SAMPLING['num_train_pos_cap']})")
     parser.add_argument("--total_cap", type=int, default=None,
                         help=f"Override num_train_total_cap "
-                             f"(default: {BAYESIAN_HPO.num_train_total_cap})")
+                             f"(default: {HPO_SAMPLING['num_train_total_cap']})")
     parser.add_argument("--val_test_cap", type=int, default=None,
                         help=f"Override val_test_total_cap "
-                             f"(default: {BAYESIAN_HPO.val_test_total_cap})")
+                             f"(default: {HPO_SAMPLING['val_test_total_cap']})")
     parser.add_argument("--seed", type=int, default=None,
                         help=f"Override seed "
-                             f"(default: {BAYESIAN_HPO.seed})")
+                             f"(default: {HPO_SAMPLING['seed']})")
     args = parser.parse_args()
 
     # ── Resolve all parameters from config + CLI overrides ────────────────
@@ -94,16 +96,16 @@ def main():
     train_years = args.train_years or TRAIN_YEARS
     val_years   = args.val_years or VAL_YEARS
     test_years  = args.test_years or TEST_YEARS
-    sds_path    = args.sds_path or SDS_PATH
+    sds_path    = resolve_path(args.sds_path or SDS_PATH)
     study_name  = args.study_name or HPO_STUDY_NAME
     n_trials    = args.n_trials if args.n_trials is not None else HPO_N_TRIALS
     n_startup   = args.n_startup if args.n_startup is not None else HPO_N_STARTUP
 
     # Build sampling config with overrides
     if args.config_name == "bayesian_hpo":
-        sampling_cfg = BAYESIAN_HPO
+        sampling_cfg = HPO_SAMPLING
     else:
-        sampling_cfg = SUBSAMPLE_SWEEP
+        sampling_cfg = SWEEP_SAMPLING
 
     overrides = {}
     if args.ratio is not None:
@@ -117,17 +119,11 @@ def main():
     if args.seed is not None:
         overrides["seed"] = args.seed
     if overrides:
-        sampling_cfg = replace(sampling_cfg, **overrides)
+        sampling_cfg = {**sampling_cfg, **overrides}
 
-    # Validate SDS path
-    if sds_path is None:
-        print("ERROR: No SDS path provided. Set SDS_PATH in config.py "
-              "or pass --sds_path on the command line.")
-        sys.exit(1)
     sds_file = Path(sds_path)
     if not sds_file.exists():
-        print(f"ERROR: SDS file not found: {sds_file}")
-        sys.exit(1)
+        sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
 
     # ── Setup ─────────────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -146,6 +142,18 @@ def main():
     )
     logger = logging.getLogger("rf_opt")
 
+    header("Random forest hyperparameter optimisation", {
+        "Labels": project_relative(sds_file),
+        "Resolution": f"{resolution}, {spatial_res}°",
+        "Train / val / test": f"{train_years} / {val_years} / {test_years}",
+        "Sampling": f"{args.config_name}: 1:{sampling_cfg['neg_ratio']}, "
+                    f"pos cap {sampling_cfg['num_train_pos_cap']:,}, "
+                    f"total cap {sampling_cfg['num_train_total_cap']:,}, "
+                    f"val/test cap {sampling_cfg['val_test_total_cap']:,}, seed {sampling_cfg['seed']}",
+        "Study": f"{study_name}, {n_trials} trials ({n_startup} random)",
+        "Output": project_relative(log_dir),
+    }, out=logger.info)
+
     # ── Load features ─────────────────────────────────────────────────────
     cache = FeatureCache(
         resolution=resolution,
@@ -161,92 +169,76 @@ def main():
     land_indices = compute_land_indices(
         ds_sds["latitude"].values, ds_sds["longitude"].values)
 
-    logger.info("\nCollecting TRAIN indices ...")
+    section("Samples", out=logger.info)
     train_pos, train_neg = collect_indices(
-        cache, cache.train_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.train_years, ds_sds, sds_var, land_indices, logger, label="Train")
 
-    logger.info("\nCollecting VAL indices ...")
     val_pos, val_neg = collect_indices(
-        cache, cache.val_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.val_years, ds_sds, sds_var, land_indices, logger, label="Val")
 
-    logger.info("\nCollecting TEST indices ...")
     test_pos, test_neg = collect_indices(
-        cache, cache.test_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.test_years, ds_sds, sds_var, land_indices, logger, label="Test")
 
     ds_sds.close()
     del ds_sds
     gc.collect()
 
     # ── Build datasets (once) ─────────────────────────────────────────────
-    rng = np.random.default_rng(sampling_cfg.seed)
+    rng = np.random.default_rng(sampling_cfg['seed'])
 
-    logger.info("\nBuilding train set ...")
     X_train, y_train, n_pos = build_train_set(
         cache, train_pos, train_neg, sampling_cfg, logger)
 
-    logger.info("Building val set ...")
     X_val, y_val = build_eval_set(
         cache, val_pos, val_neg, sampling_cfg, rng, logger, "Val")
 
-    logger.info("Building test set ...")
     X_test, y_test = build_eval_set(
         cache, test_pos, test_neg, sampling_cfg, rng, logger, "Test")
 
     del train_pos, train_neg, val_pos, val_neg, test_pos, test_neg
     gc.collect()
 
-    n_features = X_train.shape[1]
-    logger.info(f"\n  Features: {n_features}")
-    logger.info(f"  Train: {X_train.shape[0]:,}")
-    logger.info(f"  Ratio: 1:{sampling_cfg.neg_ratio}")
-    logger.info(f"  Seed: {sampling_cfg.seed}")
 
     # ── Optuna objective ──────────────────────────────────────────────────
     results_log = []
     _csv_loaded = [False]
 
+    space = HPO_SEARCH_SPACE
+
     def objective(trial):
         params = {
-            "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
-            "max_depth": trial.suggest_int("max_depth", 10, 80),
-            "min_samples_split": trial.suggest_int("min_samples_split", 2, 50, log=True),
-            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 30, log=True),
-            "max_features": trial.suggest_categorical("max_features",
-                                                       ["sqrt", "log2", 0.1, 0.2, 0.3, 0.5]),
-            "max_samples": trial.suggest_float("max_samples", 0.3, 1.0),
+            "n_estimators": trial.suggest_int("n_estimators", *space["n_estimators"][:2],
+                                              step=space["n_estimators"][2]),
+            "max_depth": trial.suggest_int("max_depth", *space["max_depth"]),
+            "min_samples_split": trial.suggest_int("min_samples_split", *space["min_samples_split"], log=True),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", *space["min_samples_leaf"], log=True),
+            "max_features": trial.suggest_categorical("max_features", space["max_features"]),
+            "max_samples": trial.suggest_float("max_samples", *space["max_samples"]),
             "bootstrap": True,
             "class_weight": None,
             "n_jobs": -1,
-            "random_state": sampling_cfg.seed,
+            "random_state": sampling_cfg['seed'],
             "verbose": 0,
         }
 
-        logger.info(f"\n{'#'*60}")
-        logger.info(f"TRIAL {trial.number}")
-        logger.info(f"{'#'*60}")
-        for k, v in sorted(params.items()):
-            if k in ("bootstrap", "class_weight", "n_jobs", "random_state", "verbose"):
-                continue
-            logger.info(f"  {k}: {v}")
+        section(f"Trial {trial.number}", out=logger.info)
+        logger.info("  " + ", ".join(
+            f"{k}={v}" for k, v in sorted(params.items())
+            if k not in ("bootstrap", "class_weight", "n_jobs", "random_state", "verbose")))
 
         t0 = time.time()
         rf = RandomForestClassifier(**params)
         rf.fit(X_train, y_train)
         t_train = time.time() - t0
-        logger.info(f"  RF trained in {t_train:.1f}s")
-
-        imp = rf.feature_importances_
-        for rank, i in enumerate(np.argsort(imp)[::-1][:3], 1):
-            logger.info(f"    {rank}. {cache.feature_vars[i]:<25s} {imp[i]:.4f}")
 
         # Evaluate on val with Platt calibration
         unique_val = np.unique(y_val)
         if len(unique_val) < 2:
-            logger.warning("  Val has only one class")
+            logger.warning("  Val set has only one class")
             return 0.0
 
         X_cal, X_eval, y_cal, y_eval = train_test_split(
-            X_val, y_val, test_size=0.5, stratify=y_val, random_state=42)
+            X_val, y_val, test_size=VAL_CALIB_FRAC, stratify=y_val, random_state=VAL_SPLIT_SEED)
 
         proba_cal = rf.predict_proba(X_cal)[:, 1]
         platt_lr = platt_fit(y_cal, proba_cal)
@@ -259,9 +251,10 @@ def main():
         test_proba = platt_apply(platt_lr, rf.predict_proba(X_test)[:, 1])
         test_m = compute_metrics(y_test, test_proba, thr)
 
-        logger.info(f"  VAL:  F1={val_m['f1']:.4f} P={val_m['precision']:.4f} "
-                    f"R={val_m['recall']:.4f} AUC={val_m['auc']:.4f} thr={thr:.4f}")
-        logger.info(f"  TEST: F1={test_m['f1']:.4f} P={test_m['precision']:.4f} "
+        logger.info(f"  Val:  F1={val_m['f1']:.4f} P={val_m['precision']:.4f} "
+                    f"R={val_m['recall']:.4f} AUC={val_m['auc']:.4f} thr={thr:.4f} "
+                    f"({t_train / 60:.1f} min)")
+        logger.info(f"  Test: F1={test_m['f1']:.4f} P={test_m['precision']:.4f} "
                     f"R={test_m['recall']:.4f} AUC={test_m['auc']:.4f}")
 
         del rf, platt_lr
@@ -290,7 +283,6 @@ def main():
             if csv_path.exists():
                 existing = pd.read_csv(csv_path)
                 results_log[:0] = existing.to_dict("records")
-                logger.info(f"  Loaded {len(existing)} existing rows from CSV")
             _csv_loaded[0] = True
         pd.DataFrame(results_log).to_csv(csv_path, index=False)
 
@@ -299,7 +291,7 @@ def main():
     # ── Run optimisation ──────────────────────────────────────────────────
     db_path = log_dir / f"study_{study_name}.db"
     storage = f"sqlite:///{db_path}"
-    sampler = TPESampler(seed=sampling_cfg.seed, n_startup_trials=n_startup)
+    sampler = TPESampler(seed=sampling_cfg['seed'], n_startup_trials=n_startup)
 
     study = optuna.create_study(
         study_name=study_name,
@@ -311,38 +303,14 @@ def main():
 
     n_existing = len(study.trials)
     if n_existing > 0:
-        logger.info(f"\n  Resuming: {n_existing} existing trials")
-        logger.info(f"  Best so far: {study.best_value:.4f}")
-
-    logger.info(f"\n{'='*60}")
-    logger.info("RF HYPERPARAMETER OPTIMISATION")
-    logger.info(f"{'='*60}")
-    logger.info(f"  SDS: {sds_file}")
-    logger.info(f"  Resolution: {resolution}, spatial: {spatial_res}")
-    logger.info(f"  Train: {train_years}, Val: {val_years}, Test: {test_years}")
-    logger.info(f"  Study: {study_name}")
-    logger.info(f"  Trials: {n_trials}")
-    logger.info(f"  Config: {args.config_name}")
-    logger.info(f"  Ratio: 1:{sampling_cfg.neg_ratio}")
-    if sampling_cfg.num_train_total_cap > 0:
-        logger.info(f"  Train total cap: {sampling_cfg.num_train_total_cap:,}")
-    else:
-        logger.info(f"  Train pos cap: {sampling_cfg.num_train_pos_cap:,}")
-    logger.info(f"  Val/test cap: {sampling_cfg.val_test_total_cap:,}")
-    logger.info(f"  Seed: {sampling_cfg.seed}")
-    logger.info(f"  Startup: {n_startup}")
-    logger.info(f"{'='*60}")
+        logger.info(f"  Resuming study: {n_existing} trials done, best val F1 {study.best_value:.4f}")
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     # ── Final report ──────────────────────────────────────────────────────
-    logger.info(f"\n{'='*60}")
-    logger.info("OPTIMISATION COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"  Best F1: {study.best_value:.4f}")
-    logger.info(f"  Best params:")
-    for k, v in study.best_params.items():
-        logger.info(f"    {k}: {v}")
+    section("Best trial", out=logger.info)
+    logger.info(f"  Val F1 {study.best_value:.4f}: "
+                + ", ".join(f"{k}={v}" for k, v in study.best_params.items()))
 
     summary = {
         "study_name": study_name,
@@ -350,24 +318,18 @@ def main():
         "best_params": study.best_params,
         "n_trials": len(study.trials),
         "sampling_config": {
-            "neg_ratio": sampling_cfg.neg_ratio,
-            "num_train_total_cap": sampling_cfg.num_train_total_cap,
-            "num_train_pos_cap": sampling_cfg.num_train_pos_cap,
-            "val_test_total_cap": sampling_cfg.val_test_total_cap,
-            "seed": sampling_cfg.seed,
+            "neg_ratio": sampling_cfg['neg_ratio'],
+            "num_train_total_cap": sampling_cfg['num_train_total_cap'],
+            "num_train_pos_cap": sampling_cfg['num_train_pos_cap'],
+            "val_test_total_cap": sampling_cfg['val_test_total_cap'],
+            "seed": sampling_cfg['seed'],
         },
-        "sds_path": str(sds_path),
+        "sds_path": project_relative(sds_path),
     }
     summary_path = log_dir / f"rf_opt_summary_{study_name}.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
-    logger.info(f"\n  Top 5:")
-    for t in sorted(study.trials, key=lambda t: t.value or 0, reverse=True)[:5]:
-        logger.info(f"    #{t.number}: F1={t.value:.4f}  {t.params}")
-
-    logger.info(f"\n  CSV: {log_dir / f'rf_opt_results_{study_name}.csv'}")
-    logger.info(f"  DB:  {db_path}")
-    logger.info(f"  Log: {log_file}")
+    done(log_dir, out=logger.info)
 
 
 if __name__ == "__main__":

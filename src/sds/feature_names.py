@@ -60,8 +60,6 @@ FEATURE_NAME_MAP = {
     "lai_lv":       ("LAI Low Vegetation", "m²/m²"),
     "lai_hv":       ("LAI High Vegetation", "m²/m²"),
 
-    "z":            ("Geopotential", "m²/s²"),
-    "elevation":    ("Elevation", "m"),
     "sdor":         ("Standard Deviation Orography", "m"),
     "slor":         ("Slope Orography", "–"),
     "anor":         ("Anisotropy Orography", "–"),
@@ -121,7 +119,7 @@ VARIABLE_GROUPS = [
         "fine_fraction", "sand_to_fines",
     ]),
     ("Orography", [
-        "sdor", "slor", "anor", "isor", "elevation",
+        "sdor", "slor", "anor", "isor",
         "wind_terrain_align",
     ]),
     ("Conflict (ACLED)", [

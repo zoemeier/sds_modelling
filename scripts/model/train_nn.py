@@ -17,7 +17,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -28,12 +27,14 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-from config import (
-    LOGS_PATH, MODELS_PATH,
-    RESOLUTION, SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
-    SDS_PATH, NN_SAMPLING, NN_PARAMS, NN_TAG,
+from sds.config import (
+    VAL_CALIB_FRAC, VAL_SPLIT_SEED, MODELS_PATH, RESOLUTION,
+    SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
+    NN_SAMPLING, NN_PARAMS, NN_TAG,
 )
-from data_utils import (
+from sds.paths import resolve_path, project_relative, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     collect_indices, build_train_set, build_eval_set,
     platt_fit, platt_apply, compute_metrics, find_best_threshold,
@@ -109,7 +110,7 @@ def main():
 
     # Data / paths
     parser.add_argument("--sds_path", type=str, default=None,
-                        help=f"Path to SDS file (default: config.SDS_PATH)")
+                        help="Path to SDS file (default: config.SDS_PATH)")
     parser.add_argument("--resolution", default=None,
                         help=f"Temporal resolution (default: {RESOLUTION})")
     parser.add_argument("--spatial", type=float, default=None,
@@ -124,12 +125,12 @@ def main():
     # Sampling overrides
     parser.add_argument("--ratio", type=int, default=None,
                         help=f"Override neg:pos ratio "
-                             f"(default: {NN_SAMPLING.neg_ratio})")
+                             f"(default: {NN_SAMPLING['neg_ratio']})")
     parser.add_argument("--pos_cap", type=int, default=None,
                         help=f"Override num_train_pos_cap "
-                             f"(default: {NN_SAMPLING.num_train_pos_cap})")
+                             f"(default: {NN_SAMPLING['num_train_pos_cap']})")
     parser.add_argument("--seed", type=int, default=None,
-                        help=f"Override seed (default: {NN_SAMPLING.seed})")
+                        help=f"Override seed (default: {NN_SAMPLING['seed']})")
 
     # Model architecture
     parser.add_argument("--hidden", nargs="+", type=int, default=None,
@@ -165,7 +166,7 @@ def main():
     train_years = args.train_years or TRAIN_YEARS
     val_years   = args.val_years or VAL_YEARS
     test_years  = args.test_years or TEST_YEARS
-    sds_path    = args.sds_path or SDS_PATH
+    sds_path    = resolve_path(args.sds_path or SDS_PATH)
     tag         = args.tag or NN_TAG
 
     # Sampling config
@@ -178,7 +179,7 @@ def main():
     if args.seed is not None:
         overrides["seed"] = args.seed
     if overrides:
-        sampling_cfg = replace(sampling_cfg, **overrides)
+        sampling_cfg = {**sampling_cfg, **overrides}
 
     # NN params
     hidden_sizes = tuple(args.hidden) if args.hidden else NN_PARAMS["hidden_sizes"]
@@ -190,17 +191,11 @@ def main():
     patience     = args.patience if args.patience is not None else NN_PARAMS["patience"]
     pos_weight_override = args.pos_weight
 
-    seed = sampling_cfg.seed
+    seed = sampling_cfg['seed']
 
-    # Validate SDS path
-    if sds_path is None:
-        print("ERROR: No SDS path provided. Set SDS_PATH in config.py "
-              "or pass --sds_path on the command line.")
-        sys.exit(1)
     sds_file = Path(sds_path)
     if not sds_file.exists():
-        print(f"ERROR: SDS file not found: {sds_file}")
-        sys.exit(1)
+        sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
 
     # ── Output directory ──────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -221,30 +216,22 @@ def main():
     logger = logging.getLogger("train_nn")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-    if device.type == "cuda":
-        logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"  Memory: "
-                     f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    logger.info("=" * 60)
-    logger.info("TRAINING NEURAL NETWORK")
-    logger.info("=" * 60)
-    logger.info(f"  Tag: {tag}")
-    logger.info(f"  SDS: {sds_file}")
-    logger.info(f"  Resolution: {resolution}, spatial: {spatial_res}")
-    logger.info(f"  Train: {train_years}, Val: {val_years}, Test: {test_years}")
-    logger.info(f"  Ratio: 1:{sampling_cfg.neg_ratio}")
-    logger.info(f"  Pos cap: {sampling_cfg.num_train_pos_cap}")
-    logger.info(f"  Seed: {seed}")
-    logger.info(f"  Architecture: {hidden_sizes}, dropout={dropout}")
-    logger.info(f"  Epochs: {epochs}, batch: {batch_size}, lr: {lr}")
-    logger.info(f"  Weight decay: {weight_decay}, patience: {patience}")
-    logger.info(f"  Output: {out_dir}")
-    logger.info("=" * 60)
+    header("Neural network", {
+        "Labels": project_relative(sds_file),
+        "Resolution": f"{resolution}, {spatial_res}°",
+        "Train / val / test": f"{train_years} / {val_years} / {test_years}",
+        "Sampling": f"1:{sampling_cfg['neg_ratio']}, pos cap {sampling_cfg['num_train_pos_cap']}, "
+                    f"seed {seed}",
+        "Network": f"hidden {list(hidden_sizes)}, dropout {dropout}",
+        "Training": f"{epochs} epochs, batch {batch_size}, lr {lr}, weight decay {weight_decay}, "
+                    f"patience {patience}",
+        "Device": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
+        "Output": project_relative(out_dir),
+    }, out=logger.info)
 
     # ── Load features ─────────────────────────────────────────────────────
     cache = FeatureCache(
@@ -260,19 +247,16 @@ def main():
     ds_sds, sds_var = load_sds_source(sds_file, logger)
     land_indices = compute_land_indices(
         ds_sds["latitude"].values, ds_sds["longitude"].values)
-    logger.info(f"  Land cells: {len(land_indices):,}")
 
-    logger.info("\nCollecting TRAIN indices ...")
+    section("Samples", out=logger.info)
     train_pos, train_neg = collect_indices(
-        cache, cache.train_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.train_years, ds_sds, sds_var, land_indices, logger, label="Train")
 
-    logger.info("\nCollecting VAL indices ...")
     val_pos, val_neg = collect_indices(
-        cache, cache.val_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.val_years, ds_sds, sds_var, land_indices, logger, label="Val")
 
-    logger.info("\nCollecting TEST indices ...")
     test_pos, test_neg = collect_indices(
-        cache, cache.test_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.test_years, ds_sds, sds_var, land_indices, logger, label="Test")
 
     ds_sds.close()
     del ds_sds
@@ -281,15 +265,12 @@ def main():
     # ── Build datasets ────────────────────────────────────────────────────
     rng = np.random.default_rng(seed)
 
-    logger.info("\nBuilding train set ...")
     X_train, y_train, n_pos_train = build_train_set(
         cache, train_pos, train_neg, sampling_cfg, logger)
 
-    logger.info("Building val set ...")
     X_val, y_val = build_eval_set(
         cache, val_pos, val_neg, sampling_cfg, rng, logger, "Val")
 
-    logger.info("Building test set ...")
     X_test, y_test = build_eval_set(
         cache, test_pos, test_neg, sampling_cfg, rng, logger, "Test")
 
@@ -297,13 +278,7 @@ def main():
     gc.collect()
 
     n_features = X_train.shape[1]
-    logger.info(f"\n  Features: {n_features}")
-    logger.info(f"  Train: {X_train.shape[0]:,}")
-    logger.info(f"  Val:   {X_val.shape[0]:,}")
-    logger.info(f"  Test:  {X_test.shape[0]:,}")
-
     # ── Standardize features ──────────────────────────────────────────────
-    logger.info("  Standardizing features ...")
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_val = scaler.transform(X_val)
@@ -315,7 +290,7 @@ def main():
     X_val_t = torch.from_numpy(X_val.copy()).float()
     X_test_t = torch.from_numpy(X_test.copy()).float()
 
-    del X_train  # numpy arrays no longer needed
+    del X_train
     gc.collect()
 
     train_ds = TensorDataset(X_train_t, y_train_t)
@@ -326,8 +301,6 @@ def main():
     model = SDSNet(n_features, hidden_sizes=hidden_sizes,
                    dropout=dropout).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"\n  Model: {model}")
-    logger.info(f"  Parameters: {n_params:,}")
 
     # ── Loss with class weighting ─────────────────────────────────────────
     if pos_weight_override is not None:
@@ -336,19 +309,17 @@ def main():
         n_neg_train = int((y_train == 0).sum())
         n_pos_t = int((y_train == 1).sum())
         pw = n_neg_train / max(n_pos_t, 1)
-    logger.info(f"  pos_weight: {pw:.2f}")
     pw_tensor = torch.tensor([pw], device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pw_tensor)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
                                   weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=5, verbose=True)
+        optimizer, mode="max", factor=NN_PARAMS["lr_decay_factor"],
+        patience=NN_PARAMS["lr_decay_patience"])
 
     # ── Training loop ─────────────────────────────────────────────────────
-    logger.info(f"\n{'='*60}")
-    logger.info("TRAINING")
-    logger.info(f"{'='*60}")
+    section(f"Train ({n_params:,} parameters, pos_weight {pw:.2f})", out=logger.info)
 
     best_val_f1 = 0.0
     best_epoch = 0
@@ -410,15 +381,11 @@ def main():
             patience_counter += 1
 
         if patience > 0 and patience_counter >= patience:
-            logger.info(f"\n  Early stopping at epoch {epoch} "
-                        f"(no improvement for {patience} epochs)")
+            logger.info(f"  Early stop at epoch {epoch} (no improvement for {patience} epochs)")
             break
 
     # ── Load best model and evaluate with Platt calibration ─────────────
-    logger.info(f"\n{'='*60}")
-    logger.info(f"EVALUATION (best epoch: {best_epoch}, "
-                f"val F1={best_val_f1:.4f})")
-    logger.info(f"{'='*60}")
+    section(f"Calibrate and evaluate (best epoch {best_epoch})", out=logger.info)
 
     ckpt = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -432,8 +399,8 @@ def main():
     if len(unique_val) >= 2 and int(y_val.sum()) >= 4:
         # Split val into calibration + evaluation halves
         val_idx = np.arange(len(y_val))
-        cal_idx, eval_idx = tts(val_idx, test_size=0.5, stratify=y_val,
-                                random_state=42)
+        cal_idx, eval_idx = tts(val_idx, test_size=VAL_CALIB_FRAC, stratify=y_val,
+                                random_state=VAL_SPLIT_SEED)
 
         proba_cal = proba_val_raw[cal_idx]
         y_cal = y_val[cal_idx]
@@ -448,25 +415,22 @@ def main():
         thr_cal = find_best_threshold(y_eval, proba_eval_cal)
         val_m_cal = compute_metrics(y_eval, proba_eval_cal, thr_cal)
 
-        # Also compute uncalibrated for comparison
+        # uncalibrated, for comparison
         thr_uncal = find_best_threshold(y_eval, proba_eval_raw)
         val_m_uncal = compute_metrics(y_eval, proba_eval_raw, thr_uncal)
 
-        logger.info(f"  VAL (calibrated,   thr={thr_cal:.4f}): "
-                    f"F1={val_m_cal['f1']:.4f}  P={val_m_cal['precision']:.4f}  "
-                    f"R={val_m_cal['recall']:.4f}  AUC={val_m_cal['auc']:.4f}")
-        logger.info(f"  VAL (uncalibrated, thr={thr_uncal:.4f}): "
-                    f"F1={val_m_uncal['f1']:.4f}  P={val_m_uncal['precision']:.4f}  "
-                    f"R={val_m_uncal['recall']:.4f}  AUC={val_m_uncal['auc']:.4f}")
+        logger.info(f"  Val:  F1={val_m_cal['f1']:.4f}  P={val_m_cal['precision']:.4f}  "
+                    f"R={val_m_cal['recall']:.4f}  AUC={val_m_cal['auc']:.4f}  thr={thr_cal:.4f} "
+                    f"(uncalibrated F1={val_m_uncal['f1']:.4f})")
 
         best_thr = thr_cal
         val_m = val_m_cal
     else:
-        logger.warning("  Val has too few positives for Platt calibration")
+        logger.warning("  Val set has too few positives for Platt calibration")
         platt_lr = None
         best_thr = find_best_threshold(y_val, proba_val_raw)
         val_m = compute_metrics(y_val, proba_val_raw, best_thr)
-        logger.info(f"  VAL: F1={val_m['f1']:.4f}  P={val_m['precision']:.4f}  "
+        logger.info(f"  Val:  F1={val_m['f1']:.4f}  P={val_m['precision']:.4f}  "
                     f"R={val_m['recall']:.4f}  AUC={val_m['auc']:.4f}")
 
     # Test with Platt calibration
@@ -476,24 +440,19 @@ def main():
     else:
         proba_test = proba_test_raw
     test_m = compute_metrics(y_test, proba_test, best_thr)
-    logger.info(f"  TEST (thr={best_thr:.4f}): "
-                f"F1={test_m['f1']:.4f}  P={test_m['precision']:.4f}  "
+    logger.info(f"  Test: F1={test_m['f1']:.4f}  P={test_m['precision']:.4f}  "
                 f"R={test_m['recall']:.4f}  AUC={test_m['auc']:.4f}")
 
     # ── Save results ──────────────────────────────────────────────────────
-    logger.info(f"\nSaving to {out_dir} ...")
-
     # Training history
     hist_path = out_dir / "training_history.csv"
     pd.DataFrame(history).to_csv(hist_path, index=False)
-    logger.info(f"  History: {hist_path}")
 
     # Platt scaler
     if platt_lr is not None:
         platt_path = out_dir / "platt_scaler.joblib"
         import joblib
         joblib.dump(platt_lr, platt_path)
-        logger.info(f"  Platt scaler: {platt_path}")
 
     # Full results JSON
     results = {
@@ -523,11 +482,11 @@ def main():
         "n_pos_train": int(y_train.sum()),
         "feature_vars": cache.feature_vars,
         "sampling_config": {
-            "neg_ratio": sampling_cfg.neg_ratio,
-            "num_train_total_cap": sampling_cfg.num_train_total_cap,
-            "num_train_pos_cap": sampling_cfg.num_train_pos_cap,
-            "val_test_total_cap": sampling_cfg.val_test_total_cap,
-            "seed": sampling_cfg.seed,
+            "neg_ratio": sampling_cfg['neg_ratio'],
+            "num_train_total_cap": sampling_cfg['num_train_total_cap'],
+            "num_train_pos_cap": sampling_cfg['num_train_pos_cap'],
+            "val_test_total_cap": sampling_cfg['val_test_total_cap'],
+            "seed": sampling_cfg['seed'],
         },
         "data_config": {
             "resolution": resolution,
@@ -535,27 +494,12 @@ def main():
             "train_years": train_years,
             "val_years": val_years,
             "test_years": test_years,
-            "sds_path": str(sds_path),
+            "sds_path": project_relative(sds_path),
         },
     }
     results_path = out_dir / "results.json"
     results_path.write_text(json.dumps(results, indent=2, default=str))
-    logger.info(f"  Results: {results_path}")
-    logger.info(f"  Model:   {best_model_path}")
-
-    # ── Done ──────────────────────────────────────────────────────────────
-    logger.info(f"\n{'='*60}")
-    logger.info("NN TRAINING COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"  Output dir: {out_dir}")
-    logger.info(f"  Val  F1={val_m['f1']:.4f}  "
-                f"P={val_m['precision']:.4f}  "
-                f"R={val_m['recall']:.4f}")
-    logger.info(f"  Test F1={test_m['f1']:.4f}  "
-                f"P={test_m['precision']:.4f}  "
-                f"R={test_m['recall']:.4f}")
-    logger.info(f"  Threshold: {best_thr:.4f}")
-    logger.info(f"{'='*60}")
+    done(out_dir, out=logger.info)
 
 
 if __name__ == "__main__":

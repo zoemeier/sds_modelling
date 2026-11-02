@@ -10,16 +10,14 @@ Output:
 """
 
 import os
-from pathlib import Path
 import json
 
 import requests as r
 from tqdm import tqdm
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-OUT_PATH = PROJECT_ROOT / "data" / "ndvi"
-PW_PATH = PROJECT_ROOT / "passwords.json"
+from sds.config import YEARS, NDVI_PATH as OUT_PATH, PASSWORDS_FILE as PW_PATH
+from sds.log_utils import header, done
 with open(PW_PATH) as f:
     pws = json.load(f)
 
@@ -42,6 +40,9 @@ def download_task_bundle(task_id, destDir, head):
     for f_key, fname in files.items():
         url = f"{api}bundle/{task_id}/{f_key}"
         filepath = os.path.join(destDir, os.path.basename(fname))
+        if os.path.exists(filepath):
+            print(f"  Already exists: {fname}")
+            continue
         temp_path = filepath + ".part"
         resume_byte_pos = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
 
@@ -62,18 +63,22 @@ def download_task_bundle(task_id, destDir, head):
                         f_out.write(chunk)
                         pbar.update(len(chunk))
         os.rename(temp_path, filepath)
-        print(f"Downloaded {filepath}")
+        print(f"  Saved: {fname}")
 
+
+header("NDVI download (AppEEARS)", {"Years": f"{min(YEARS)}-{max(YEARS)}"})
 
 resp = r.get(f'{api}task', headers=headers)
 resp.raise_for_status()
 tasks = resp.json()
 
-years = range(2015, 2025)
-target_task_names = {f"{y}-ndvi-big" for y in years}
+target_task_names = {f"{y}-ndvi" for y in YEARS}
 
-for t in tasks:
-    print(t['task_name'], t['status'])
+status = {t['task_name']: t['status'] for t in tasks if t['task_name'] in target_task_names}
+not_ready = sorted(n for n in target_task_names if status.get(n) != 'done')
+if not_ready:
+    print("  WARNING: not ready (skipped): "
+          + ", ".join(f"{n} ({status.get(n, 'not submitted')})" for n in not_ready))
 
 tasks_to_download = [
     t for t in tasks
@@ -85,5 +90,7 @@ for task in tasks_to_download:
     task_id = task['task_id']
     task_name = task['task_name']
     file_path = OUT_PATH / task_name
-    print(f"Downloading {task_name} ...")
+    print(f"\n{task_name}")
     download_task_bundle(task_id, file_path, headers)
+
+done(OUT_PATH)

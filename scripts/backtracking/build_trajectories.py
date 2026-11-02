@@ -1,38 +1,36 @@
 """
-SDS (Sand and Dust Storm) Plume Tracking — Overlap-based + Wind Advection
-==========================================================================
+SDS backtracking, step 1: plume segmentation + trajectory building
+===================================================================
+Segments dust plumes at every timestep, links them into trajectories (raw or
+wind-shifted IoU) and derives the genesis regions of every trajectory.
+
 Parameterised runner with logging and experiment summary.
 All arguments accept multiple values; the script runs every combination
 (cartesian product / grid search).
 
 Usage examples:
   # Default single run (daily, 0.25°, duaod=0.3, angstr=0.4, pm10=1.5e-7)
-  python sds_windshift_tracker.py
+  python build_trajectories.py
 
   # Sweep Angstrom threshold (3 runs)
-  python sds_windshift_tracker.py --angstr 0.6 0.7 0.8
+  python build_trajectories.py --angstr 0.6 0.7 0.8
 
   # Full grid: 2 resolutions x 2 grid_res x 3 angstr = 12 runs
-  python sds_windshift_tracker.py --resolution daily 6h --grid_res 0.25 0.75 --angstr 0.6 0.7 0.8
+  python build_trajectories.py --resolution daily 6h --grid_res 0.25 0.75 --angstr 0.6 0.7 0.8
 
   # Preview combinations without running
-  python sds_windshift_tracker.py --resolution daily 6h --angstr 0.6 0.7 0.8 --dry_run
+  python build_trajectories.py --resolution daily 6h --angstr 0.6 0.7 0.8 --dry_run
 
 Each run saves outputs to:
-  DATA_PATH / backtrace_overlap_output / windshift / {resolution}_{grid_res} / {params}
+  data/backtracking/{resolution}_{grid_res}/{params}
 
 A run_log.txt is written to each output folder capturing all terminal output.
-An experiment_summary.csv is appended after each run with parameters and key
+A row is appended to data/backtracking/build_trajectories_runs.csv after each run with parameters and key
 result metrics for easy comparison across experiments.
 """
 
-from pathlib import Path
-
-
 import argparse
 import sys
-import io
-import tempfile
 import time as _time
 import numpy as np
 import pandas as pd
@@ -44,94 +42,15 @@ from tqdm import tqdm
 import gc
 
 
-# =============================================================================
-# PROJECT PATHS
-# =============================================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH    = PROJECT_ROOT / "data"
-INTERIM_PATH = DATA_PATH / "interim"
-
-# (temporal_resolution, grid_resolution) -> (input filename, dt_hours)
-RESOLUTION_MAP = {
-    ("daily", 0.25): ("BACKTRACING_INPUT_2015-2024_daily_025.nc",  24),
-    ("6h",    0.25): ("BACKTRACING_INPUT_2015-2024_6hourly_025.nc",      6),
-    ("3h",    0.25): ("BACKTRACING_INPUT_2015-2024_3hourly_025.nc",      3),
-    ("daily", 0.75): ("BACKTRACING_INPUT_2015-2024_daily_075.nc",  24),
-    ("6h",    0.75): ("BACKTRACING_INPUT_2015-2024_6hourly_075.nc",      6),
-    ("3h",    0.75): ("BACKTRACING_INPUT_2015-2024_3hourly_075.nc",      3),
-}
-
-EXPERIMENT_SUMMARY_CSV = DATA_PATH / "backtrace_overlap_output" / "combination_overlap" / "experiment_summary.csv"
+from sds.config import RESOLUTION, SPATIAL_RES, STEP1_PARAMS as S1, WINDSHIFT_SCORE_FACTOR
+from sds.paths import (
+    STEP1_SUMMARY_CSV as EXPERIMENT_SUMMARY_CSV, backtracking_input, grid_dir, step1_folder_name,
+    project_relative,
+)
+from sds.log_utils import TeeLogger, header, section, done
 
 U_WIND_VAR = "u10"
 V_WIND_VAR = "v10"
-
-
-# =============================================================================
-# LOGGING HELPER 
-# =============================================================================
-
-class TeeLogger:
-    """Write to both stdout and a log file simultaneously."""
-    def __init__(self, logpath: Path):
-        self.terminal = sys.stdout
-        self.logfile  = open(logpath, "w", buffering=1)
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.logfile.write(message)
-
-    def flush(self):
-        self.terminal.flush()
-        self.logfile.flush()
-
-    def close(self):
-        self.logfile.close()
-
-
-# =============================================================================
-# PARAMETER FOLDER NAME
-# =============================================================================
-
-def make_folder_name(angstr, duaod, pm10, min_pixels, iou, max_gap, stubs, memory):
-    """
-    Encode all tracking parameters in a dot-free folder name.
-
-    Encoding rules:
-      angstr, duaod : remove decimal point, keep leading zeros
-                      0.8 -> 08, 0.25 -> 025, 0.2 -> 02
-      pm10          : express as integer coefficient + 'en' + exponent
-                      1.5e-7 -> 15en-8, 2e-7 -> 2en-7, 1e-8 -> 1en-8
-      iou           : remove decimal point, keep leading zeros
-                      0.1 -> 01, 0.01 -> 001, 0.001 -> 0001
-      others        : integer as-is
-
-    Example: '08ae_02duaod_15en-8pm10_4px_01iou_1gap_1stub_0mem'
-    """
-    # angstr, duaod, iou: replace "0." with "0", trim trailing zeros.
-    # 0.8->"08", 0.25->"025", 0.2->"02", 0.01->"001", 0.001->"0001"
-    def _dotfree(val):
-        s = f"{val:.10f}".rstrip("0").rstrip(".")  # "0.25", "0.001"
-        return s.replace(".", "")                    # "025",  "0001"
-
-    ae_str    = _dotfree(angstr)
-    duaod_str = _dotfree(duaod)
-
-    # pm10: express as integer coefficient x 10^exp, e.g. 1.5e-7 = 15e-8
-    exp = int(np.floor(np.log10(abs(pm10))))
-    coeff = pm10 / (10 ** exp)
-    # Shift until coefficient is an integer (e.g. 1.5 -> 15, exp -7 -> -8)
-    while coeff != int(coeff) and abs(coeff) < 1e6:
-        coeff *= 10
-        exp -= 1
-    pm10_str = f"{int(coeff)}en{exp}"
-
-    # iou: same as angstr/duaod
-    iou_str = _dotfree(iou)
-
-    return (f"{ae_str}ae_{duaod_str}duaod_{pm10_str}pm10"
-            f"_{min_pixels}px_{iou_str}iou_{max_gap}gap_{stubs}stub_{memory}mem")
 
 
 # =============================================================================
@@ -139,16 +58,16 @@ def make_folder_name(angstr, duaod, pm10, min_pixels, iou, max_gap, stubs, memor
 # =============================================================================
 
 def run_tracking(
-    resolution: str = "daily",
-    grid_res: float = 0.25,
-    duaod_thr: float = 0.2,
-    angstr_thr: float = 0.8,
-    pm10_thr: float = 1.5e-7,
-    min_pixels: int = 4,
-    iou_thr: float = 0.1,
-    max_gap_pixels: int = 1,
-    stubs: int = 1,
-    memory: int = 0,
+    resolution: str = RESOLUTION,
+    grid_res: float = SPATIAL_RES,
+    duaod_thr: float = S1["duaod"],
+    angstr_thr: float = S1["angstr"],
+    pm10_thr: float = S1["pm10"],
+    min_pixels: int = S1["min_pixels"],
+    iou_thr: float = S1["iou"],
+    max_gap_pixels: int = S1["max_gap"],
+    stubs: int = S1["stubs"],
+    memory: int = S1["memory"],
 ):
     """
     Run the full SDS wind-shift tracking pipeline with the given parameters.
@@ -157,25 +76,18 @@ def run_tracking(
     wall_start = _time.time()
 
     # ---- Resolve paths ----
-    res_key = (resolution, grid_res)
-    if res_key not in RESOLUTION_MAP:
-        raise ValueError(f"Unknown resolution combo {res_key}. "
-                         f"Choose from {list(RESOLUTION_MAP.keys())}")
-    in_filename, dt_hours = RESOLUTION_MAP[res_key]
-    in_fp = INTERIM_PATH / in_filename
-
-    # Grid res as string for folder name: 0.25 -> "025", 0.75 -> "075"
-    grid_res_str = f"{grid_res:.2f}".replace(".", "")
-    folder_name = make_folder_name(angstr_thr, duaod_thr, pm10_thr, min_pixels,
+    in_fp, dt_hours = backtracking_input(resolution, grid_res)
+    if not in_fp.exists():
+        raise FileNotFoundError(f"{in_fp} not found. Run prepare_backtracking_data.py first.")
+    folder_name = step1_folder_name(angstr_thr, duaod_thr, pm10_thr, min_pixels,
                                     iou_thr, max_gap_pixels, stubs, memory)
-    out_dir = (DATA_PATH / "backtrace_overlap_output" / "combination_overlap"
-               / f"{resolution}_{grid_res_str}" / folder_name)
+    out_dir = grid_dir(resolution, grid_res) / folder_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Check if this experiment was already run ----
     done_marker = out_dir / "_RUN_COMPLETE"
     if done_marker.exists():
-        print(f"  SKIPPING (already completed): {out_dir}")
+        print(f"  Already exists: {project_relative(out_dir)}")
         return None
 
     # ---- Start logging ----
@@ -183,31 +95,21 @@ def run_tracking(
     logger = TeeLogger(log_path)
     sys.stdout = logger
 
-    print("=" * 72)
-    print("SDS Wind-Shift Plume Tracking")
-    print("=" * 72)
-    print(f"  Resolution   : {resolution} (dt = {dt_hours}h)")
-    print(f"  Grid res     : {grid_res}°")
-    print(f"  Input file   : {in_fp}")
-    print(f"  Output dir   : {out_dir}")
-    print(f"  DUAOD_THR    : {duaod_thr}")
-    print(f"  ANGSTR_THR   : {angstr_thr}")
-    print(f"  PM10_THR     : {pm10_thr:.2e}")
-    print(f"  MIN_PIXELS   : {min_pixels}")
-    print(f"  IOU_THR      : {iou_thr}")
-    print(f"  MAX_GAP_PX   : {max_gap_pixels}")
-    print(f"  STUBS        : {stubs}")
-    print(f"  MEMORY       : {memory}")
-    print()
+    header("Backtracking step 1: trajectory building", {
+        "Resolution": f"{resolution}, {grid_res}°",
+        "Input": project_relative(in_fp),
+        "Output": project_relative(out_dir),
+        "duaod / angstr / pm10": f"{duaod_thr} / {angstr_thr} / {pm10_thr:.2e}",
+        "min_pixels / iou / max_gap": f"{min_pixels} / {iou_thr} / {max_gap_pixels}",
+        "stubs / memory": f"{stubs} / {memory}",
+    })
 
     # =========================================================================
     # STEP 1 - OPEN DATASET LAZILY
     # =========================================================================
-    print("Opening dataset (lazy) ...")
     ds = xr.open_dataset(in_fp)
     if "valid_time" in ds.dims or "valid_time" in ds.coords:
         ds = ds.rename({"valid_time": "time"})
-        print("  Renamed 'valid_time' -> 'time'")
 
     LAT   = ds["latitude"].values
     LON   = ds["longitude"].values
@@ -215,9 +117,6 @@ def run_tracking(
     NT    = len(TIMES)
     NLAT  = len(LAT)
     NLON  = len(LON)
-    print(f"  Grid: {NLAT} lat x {NLON} lon,  {NT} timesteps")
-    print(f"  Approx input size per variable: "
-          f"{NT * NLAT * NLON * 4 / 1e9:.1f} GB (float32)")
 
     LAT_DESCENDING = LAT[0] > LAT[-1]
 
@@ -310,8 +209,8 @@ def run_tracking(
 
         Priority order:
           1. Raw (non-shifted) IoU — if match, accept immediately
-          2. Wind-shifted IoU — if match AND raw also matched, score as
-             combination_overlap (higher score); otherwise wind-shift only
+          2. Wind-shifted IoU — if match AND raw also matched, score as a
+             combination match (higher score); otherwise wind-shift only
           3. Proximity gap-bridging — last resort
         """
         # 1. Raw overlap (no wind shift)
@@ -337,7 +236,7 @@ def run_tracking(
 
         # Wind-shifted only
         if wind_match:
-            return v_shifted * 0.9, MATCH_WINDSHIFT, 0.0
+            return v_shifted * WINDSHIFT_SCORE_FACTOR, MATCH_WINDSHIFT, 0.0
 
         # 3. Proximity
         if max_gap_pixels > 0:
@@ -350,7 +249,7 @@ def run_tracking(
     # =========================================================================
     # STEP 2 - CONNECTED COMPONENT LABELING
     # =========================================================================
-    print("\nLabeling connected components (memory-mapped) ...")
+    section("Label plumes")
     STRUCT = ndimage.generate_binary_structure(2, 2)
 
     _mmap_path = out_dir / "_blob_labels.mmap"
@@ -396,13 +295,12 @@ def run_tracking(
         blobs_per_t.append(blobs)
 
     blob_labels.flush()
-    print(f"  Storm-flagged timesteps: {flagged} / {NT}")
-    print(f"  Total blobs detected:    {sum(len(b) for b in blobs_per_t):,}")
+    print(f"  Plumes: {sum(len(b) for b in blobs_per_t):,} in {flagged:,} of {NT:,} timesteps")
 
     # =========================================================================
     # STEP 3 - OVERLAP LINKING
     # =========================================================================
-    print("\nLinking blobs (shifted-IoU with wind advection) ...")
+    section("Link plumes into trajectories")
 
     next_cell_id    = 1
     active_tracks   = {}
@@ -412,7 +310,6 @@ def run_tracking(
     split_log       = []
     proximity_log   = []
     lineage_registry = {}
-    fid_to_size = {row["feature"]: row["num"] for row in all_feature_rows}
 
     # Match method counters
     match_counts = {
@@ -423,18 +320,6 @@ def run_tracking(
     }
 
     for ti in tqdm(range(NT), desc="  Linking"):
-        if ti % 200 == 0:
-            try:
-                import psutil, os
-                mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1e6
-            except ImportError:
-                mem_mb = 0
-            max_lineage = max((len(v) for v in lineage_registry.values()), default=0)
-            total_lineage = sum(len(v) for v in lineage_registry.values())
-            print(f"\n[ti={ti}] date={pd.Timestamp(TIMES[ti]).date()}  "
-                  f"RAM={mem_mb:.0f}MB  active={len(active_tracks)}  "
-                  f"lineage_entries={total_lineage:,}  max_per_cell={max_lineage}")
-
         current_blobs = blobs_per_t[ti]
         layer = blob_labels[ti]
 
@@ -644,20 +529,19 @@ def run_tracking(
     for cid, tdata in list(active_tracks.items()):
         closed_tracks.append((cid, tdata))
 
-    print(f"  Merge events: {len(merge_log)}")
-    print(f"  Split events: {len(split_log)}")
+    print(f"  Merges: {len(merge_log):,}, splits: {len(split_log):,}")
     total_matches = sum(match_counts.values())
-    print(f"  Match statistics ({total_matches:,} total links):")
-    for method, count in match_counts.items():
-        pct = 100 * count / total_matches if total_matches else 0
-        print(f"    {method:12s}: {count:>8,}  ({pct:5.1f}%)")
-    print(f"  Tracks before stub filter: {len(closed_tracks)}")
+    print(f"  Links: {total_matches:,} (" + ", ".join(
+        f"{m} {100 * c / max(total_matches, 1):.1f}%" for m, c in match_counts.items()) + ")")
+    n_before_stubs = len(closed_tracks)
 
     closed_tracks = [
         (cid, td) for cid, td in closed_tracks
         if len(td["feature_ids"]) >= stubs
     ]
-    print(f"  Tracks after stub filter (>= {stubs} timesteps): {len(closed_tracks)}")
+    print(f"  Trajectories: {len(closed_tracks):,}"
+          + (f" ({n_before_stubs - len(closed_tracks):,} shorter than {stubs} timesteps removed)"
+             if stubs > 0 else ""))
 
     valid_cell_ids  = {cid for cid, _ in closed_tracks}
     feature_to_cell = {
@@ -684,7 +568,6 @@ def run_tracking(
         columns=["cell_id", "genesis_cell", "source_time", "acquired_via", "acquired_at"]
     )
     lineage_df.to_csv(out_dir / "sds_lineage.csv", index=False)
-    print(f"  Lineage saved ({len(lineage_df)} rows)")
 
     # Merge log
     merge_df = pd.DataFrame(merge_log) if merge_log else pd.DataFrame(
@@ -694,7 +577,6 @@ def run_tracking(
     if len(merge_df):
         merge_df = merge_df[merge_df["dominant_cell"].isin(valid_cell_ids)]
     merge_df.to_csv(out_dir / "sds_merges.csv", index=False)
-    print(f"  Merge log saved ({len(merge_df)} events)")
 
     # Split log
     split_df = pd.DataFrame(split_log) if split_log else pd.DataFrame(
@@ -707,7 +589,6 @@ def run_tracking(
         split_df = split_df[split_df["parent_cell"].isin(valid_cell_ids)]
     split_df = split_df.drop(columns=["child_fid"], errors="ignore")
     split_df.to_csv(out_dir / "sds_splits.csv", index=False)
-    print(f"  Split log saved ({len(split_df)} events)")
 
     # Save proximity match log
     prox_df = pd.DataFrame(proximity_log) if proximity_log else pd.DataFrame(
@@ -717,12 +598,11 @@ def run_tracking(
     if len(prox_df):
         prox_df = prox_df[prox_df["cell"].isin(valid_cell_ids)]
     prox_df.to_csv(out_dir / "sds_proximity_matches.csv", index=False)
-    print(f"  Proximity match log saved ({len(prox_df)} events)")
 
     # =========================================================================
     # STEP 4 - BUILD OUTPUT DATAFRAMES
     # =========================================================================
-    print("\nBuilding output DataFrames ...")
+    section("Save trajectories and masks")
 
     features_df = pd.DataFrame(all_feature_rows)
     features_df["cell"] = features_df["feature"].map(feature_to_cell)
@@ -747,12 +627,11 @@ def run_tracking(
     tracks_df["cell_parent_track_id"] = np.nan
 
     n_tracks = int(tracks_df["cell"].nunique())
-    print(f"  Final track count: {n_tracks:,}")
 
     features_df.to_hdf(out_dir / "sds_features.h5", key="table")
     tracks_df.to_hdf(out_dir / "sds_tracks.h5",     key="table")
-    print(f"  Saved features -> sds_features.h5")
-    print(f"  Saved tracks   -> sds_tracks.h5")
+    print("  Saved: sds_features.h5, sds_tracks.h5, sds_lineage.csv, sds_merges.csv, "
+          "sds_splits.csv, sds_proximity_matches.csv")
 
     del all_feature_rows
     gc.collect()
@@ -760,7 +639,6 @@ def run_tracking(
     # =========================================================================
     # STEP 5 - SEGMENTATION MASK
     # =========================================================================
-    print("\nWriting segmentation mask (incremental) ...")
 
     max_fid = int(features_df["feature"].max()) if len(features_df) else 0
     fid_to_cid = np.zeros(max_fid + 1, dtype=np.int32)
@@ -810,7 +688,7 @@ def run_tracking(
             remapped[valid] = fid_to_cid[layer[valid]]
             seg_var[ti] = remapped
 
-    print(f"  Segmentation saved -> {seg_path}")
+    print(f"  Saved: {seg_path.name}")
     del blob_labels
     _mmap_path.unlink(missing_ok=True)
     gc.collect()
@@ -818,8 +696,6 @@ def run_tracking(
     # =========================================================================
     # STEP 6 - SOURCE LOCATIONS
     # =========================================================================
-    print("\nExtracting source locations ...")
-
     sources = (
         tracks_df
         .sort_values("time")
@@ -835,7 +711,7 @@ def run_tracking(
         .reset_index(drop=True)
     )
     sources.to_csv(out_dir / "sds_sources.csv", index=False)
-    print(f"  Saved {len(sources):,} source records -> sds_sources.csv")
+    print(f"  Saved: sds_sources.csv ({len(sources):,} sources)")
 
     # =========================================================================
     # STEP 7 - TRACK SUMMARY
@@ -860,13 +736,7 @@ def run_tracking(
     ).round(1)
 
     summary.to_csv(out_dir / "sds_track_summary.csv", index=False)
-    print(f"\nTop 10 tracks by displacement:")
-    print(
-        summary.nlargest(10, "displacement_km")
-               [["cell", "source_time", "source_lat", "source_lon",
-                 "lifetime_h", "displacement_km"]]
-               .to_string(index=False)
-    )
+    print("  Saved: sds_track_summary.csv")
 
     # Compute longest track (max number of timesteps)
     track_lengths = tracks_df.groupby("cell")["frame"].nunique()
@@ -883,8 +753,6 @@ def run_tracking(
     # =========================================================================
     # STEP 8 - SOURCE PIXEL MASKS
     # =========================================================================
-    print("\nWriting source pixel masks (incremental) ...")
-
     first_rows = (
         tracks_df.sort_values("time")
         .groupby("cell", as_index=False)
@@ -940,12 +808,11 @@ def run_tracking(
             )
 
     src_seg_ds.close()
-    print(f"  Source masks saved -> {src_mask_path}")
+    print(f"  Saved: {src_mask_path.name}")
 
     # =========================================================================
     # STEP 9 - GENESIS MASK
     # =========================================================================
-    print("\nBuilding genesis mask (all genesis regions) ...")
     from collections import defaultdict
 
     inp_times_pd = pd.to_datetime(TIMES)
@@ -958,9 +825,8 @@ def run_tracking(
     _src_cell_ids = _src_nc["cell"][:].astype(int)
     _src_cell_index = {int(cid): ci for ci, cid in enumerate(_src_cell_ids)}
     _src_st_units = _src_nc["source_time"].units
-    _src_st_cal   = getattr(_src_nc["source_time"], "calendar", "standard")
     _src_st_vals  = nc4.num2date(_src_nc["source_time"][:],
-                                  units=_src_st_units, calendar=_src_st_cal)
+                                  units=_src_st_units, calendar=_src_nc["source_time"].calendar)
     for gc_cell in all_genesis_cells:
         ci = _src_cell_index.get(gc_cell)
         if ci is None:
@@ -1014,17 +880,13 @@ def run_tracking(
         for entries in genesis_by_ti.values()
         for _, bmask in entries
     )
-    print(f"  Genesis mask saved -> {genesis_path}")
-    print(f"  Total genesis regions: {len(all_genesis_cells):,}")
-    print(f"  Total genesis pixels : {total_genesis_px:,}")
+    print(f"  Saved: {genesis_path.name} ({len(all_genesis_cells):,} genesis regions, "
+          f"{total_genesis_px:,} pixels)")
 
     # =========================================================================
     # TIMING
     # =========================================================================
     wall_elapsed = _time.time() - wall_start
-    print(f"\n{'=' * 72}")
-    print(f"Run complete in {wall_elapsed / 60:.1f} minutes")
-    print(f"{'=' * 72}")
 
     # Close dataset
     ds.close()
@@ -1034,7 +896,7 @@ def run_tracking(
     # =========================================================================
     experiment_row = {
         "run_timestamp"       : pd.Timestamp.now().isoformat(),
-        "method"              : "Combination Overlap",
+        "method"              : "trajectory building",
         "grid_res"            : grid_res,
         "resolution"          : resolution,
         "dt_hours"            : dt_hours,
@@ -1079,7 +941,7 @@ def run_tracking(
     else:
         combined = row_df
     combined.to_csv(EXPERIMENT_SUMMARY_CSV, index=False)
-    print(f"\nExperiment summary appended -> {EXPERIMENT_SUMMARY_CSV}")
+    done(f"{project_relative(out_dir)} ({wall_elapsed / 60:.1f} min)")
 
     # Restore stdout
     sys.stdout = logger.terminal
@@ -1097,36 +959,36 @@ def run_tracking(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="SDS Wind-Shift Plume Tracking — parameterised runner. "
+        description="SDS backtracking, step 1: trajectory building. "
                     "Pass multiple values per argument to run all combinations "
                     "(grid search).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   # Single run with defaults
-  python sds_windshift_tracker.py 
+  python build_trajectories.py 
 
   # Sweep Angstrom threshold
-  python sds_windshift_tracker.py --angstr 0.6 0.7 0.8
+  python build_trajectories.py --angstr 0.6 0.7 0.8
 
   # Full grid: 2 resolutions x 2 grid_res x 3 angstr = 12 runs
-  python sds_windshift_tracker.py --resolution daily 6h --grid_res 0.25 0.75 --angstr 0.6 0.7 0.8
+  python build_trajectories.py --resolution daily 6h --grid_res 0.25 0.75 --angstr 0.6 0.7 0.8
 
   # Dry run — just print the combinations without running
-  python sds_windshift_tracker.py --angstr 0.6 0.7 0.8 --grid_res 0.25 0.75 --dry_run
-""", #TODO: change filename!!!!!!!!
+  python build_trajectories.py --angstr 0.6 0.7 0.8 --grid_res 0.25 0.75 --dry_run
+""",
     )
-    p.add_argument("--resolution", nargs="+", default=["daily"],
+    p.add_argument("--resolution", nargs="+", default=[RESOLUTION],
                    help="Temporal resolution(s): daily, 6h, 3h")
-    p.add_argument("--grid_res",   nargs="+", type=float, default=[0.25],
+    p.add_argument("--grid_res",   nargs="+", type=float, default=[SPATIAL_RES],
                    help="Spatial grid resolution(s) in degrees: 0.25, 0.75")
-    p.add_argument("--duaod",      nargs="+", type=float, default=[0.3])
-    p.add_argument("--angstr",     nargs="+", type=float, default=[0.4])
-    p.add_argument("--pm10",       nargs="+", type=float, default=[1.5e-7])
-    p.add_argument("--min_pixels", nargs="+", type=int,   default=[0])
-    p.add_argument("--iou",        nargs="+", type=float, default=[0.25])
-    p.add_argument("--max_gap",    nargs="+", type=int,   default=[0])
-    p.add_argument("--stubs",      nargs="+", type=int,   default=[0])
-    p.add_argument("--memory",     nargs="+", type=int,   default=[0])
+    p.add_argument("--duaod",      nargs="+", type=float, default=[S1["duaod"]])
+    p.add_argument("--angstr",     nargs="+", type=float, default=[S1["angstr"]])
+    p.add_argument("--pm10",       nargs="+", type=float, default=[S1["pm10"]])
+    p.add_argument("--min_pixels", nargs="+", type=int,   default=[S1["min_pixels"]])
+    p.add_argument("--iou",        nargs="+", type=float, default=[S1["iou"]])
+    p.add_argument("--max_gap",    nargs="+", type=int,   default=[S1["max_gap"]])
+    p.add_argument("--stubs",      nargs="+", type=int,   default=[S1["stubs"]])
+    p.add_argument("--memory",     nargs="+", type=int,   default=[S1["memory"]])
     p.add_argument("--dry_run",    action="store_true",
                    help="Print all parameter combinations and exit")
     return p.parse_args()
@@ -1153,25 +1015,22 @@ def main():
     combos = build_grid(args)
 
     n = len(combos)
-    print(f"Parameter grid: {n} combination{'s' if n != 1 else ''}")
-    for i, c in enumerate(combos):
-        print(f"  [{i+1:3d}] {c}")
-
+    if n > 1 or args.dry_run:
+        print(f"Parameter grid: {n} run{'s' if n != 1 else ''}")
+        for i, c in enumerate(combos):
+            print(f"  [{i+1:3d}] {c}")
     if args.dry_run:
-        print("\n--dry_run set, exiting without running.")
         return
 
-    print()
     for idx, combo in enumerate(combos):
-        print(f"\n{'#' * 72}")
-        print(f"# Experiment {idx + 1} / {n}")
-        print(f"# {combo}")
-        print(f"{'#' * 72}\n")
+        if n > 1:
+            print(f"\nRun {idx + 1} / {n}")
 
         # Validate resolution combo
-        res_key = (combo["resolution"], combo["grid_res"])
-        if res_key not in RESOLUTION_MAP:
-            print(f"  ERROR: no input file for {res_key}, skipping.")
+        try:
+            backtracking_input(combo["resolution"], combo["grid_res"])
+        except ValueError as e:
+            print(f"  ERROR: {e} (run skipped)")
             continue
 
         run_tracking(
@@ -1188,8 +1047,8 @@ def main():
         )
         gc.collect()
 
-    print(f"\nAll done. {n} experiments completed.")
-    print(f"Summary at: {EXPERIMENT_SUMMARY_CSV}")
+    if n > 1:
+        print(f"\nAll {n} runs finished, summary: {project_relative(EXPERIMENT_SUMMARY_CSV)}")
 
 
 if __name__ == "__main__":

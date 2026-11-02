@@ -28,37 +28,22 @@ import xarray as xr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-# custom imports 
-from config import RESOLUTION, SPATIAL_RES, VAL_YEARS, TEST_YEARS, SDS_PATH
-from data_utils import (
-    FeatureCache, load_sds_source, compute_land_indices,
+from sds.config import DOMAIN, RESOLUTION, SPATIAL_RES, VAL_YEARS, TEST_YEARS
+from sds.paths import model_figures_dir, resolve_path, project_relative, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
+    FeatureCache, load_sds_source, compute_land_indices, make_stype_for_year,
     collect_indices, extract_from_cache, platt_apply,
 )
-from feature_names import get_feature_name_map, get_active_groups
+from sds.feature_names import get_feature_name_map, get_active_groups
 
 warnings.filterwarnings("ignore")
 
 
 # Plotting parameters
 # ---------------------------------------------------------------------------
-# Styling rule for this module (kept consistent across every plot function):
-#
-#   - Main titles (suptitle, or a single set_title on solo-axis figures):
-#         fontsize=TITLE_SIZE,  fontweight="bold"
-#   - Subplot/panel titles inside multi-axis figures:
-#         fontsize=SUBTITLE_SIZE or SUBPLOT_TITLE_SIZE, non-bold
-#         (SUBTITLE_SIZE for a few big subplots like ROC+PR;
-#          SUBPLOT_TITLE_SIZE for small-grid subplots like KDE groups / composite)
-#   - Axis labels:   LABEL_SIZE (rcParams default)
-#   - Tick labels:   TICK_SIZE  (rcParams default)
-#   - Legends:       LEGEND_SIZE (rcParams default)
-#
-# In-axis text that is *data* rather than *chrome* (e.g. confusion-matrix cell
-# values, bar-chart count annotations) uses LABEL_SIZE ± a small offset and
-# may be bold if it's the plot's primary readout.
-#
-# Don't hardcode raw point sizes - derive from these constants so a single
-# edit here retunes the whole module.
+# Main titles TITLE_SIZE bold, panel titles SUBTITLE_SIZE / SUBPLOT_TITLE_SIZE;
+# all font sizes derive from these constants.
 TITLE_SIZE = 14
 SUBTITLE_SIZE = 12
 LABEL_SIZE = 11
@@ -88,7 +73,6 @@ STYPE_LABELS = {1: "Genesis", 2: "Intermediate"}
 VAR_SUBPLOT_W = 4.0
 VAR_SUBPLOT_H = 3.0
 
-DOMAIN = {"north": 50.0, "south": 0.0, "west": -18.0, "east": 85.0}
 _YEAR_RANGES: dict = {} #filled in main with years from config
 
 
@@ -98,7 +82,7 @@ _YEAR_RANGES: dict = {} #filled in main with years from config
 def safe_div(a, b): return np.where(b > 0, a / b, np.nan)  # for precision/recall in regions with no positives
 
 def _tag_label(tag):
-    # for nice labels of splits using years from config, e.g. Test (2024)
+    # e.g. "Test (2024)", using the split years from the config
     yr = _YEAR_RANGES.get(tag)
     yr_str = str(yr[0]) if yr[0] == yr[1] else f"{yr[0]}–{yr[1]}"
     return f"{'Test' if tag == 'test' else 'Validation'} ({yr_str})"
@@ -155,9 +139,7 @@ def _mapplot(lons, lats, data, title, cmap, vmin, vmax, fname, od, label="",
                        zorder=1, transform=ccrs.PlateCarree())
     ax.set_title(title, fontsize=TITLE_SIZE, fontweight="bold", pad=10)
 
-    # ---- colorbar aligned with the actual visible map frame ----
-    # Force a draw so the cartopy axes reports its true (post-letterbox) position,
-    # then carve the colorbar axes out by hand using that exact y-range.
+    # colorbar as tall as the visible map frame (draw first: cartopy letterboxes the axes)
     fig.canvas.draw()
     pos = ax.get_position()  # bbox of the *visible* map frame in figure coords
     cb_w   = 0.018           # colorbar width (figure fraction)
@@ -168,10 +150,6 @@ def _mapplot(lons, lats, data, title, cmap, vmin, vmax, fname, od, label="",
     cb.set_label(label, fontsize=LABEL_SIZE)
     cb.ax.tick_params(labelsize=TICK_SIZE)
 
-    print(f"    _mapplot: vmin={vmin:.4f} vmax={vmax:.4f} "
-          f"finite={len(finite)} nan={np.isnan(data).sum()} fname={fname}")
-
-    
     fig.savefig(od / fname)
     plt.close(fig)
 
@@ -180,16 +158,12 @@ def _build_grids(lat, lon, y, proba, oc):
     nl, no = len(ul), len(ulo)
     li, loi = np.searchsorted(ul, lat), np.searchsorted(ulo, lon)
 
-    print(f"    _build_grids: {len(y)} samples, {nl} lats, {no} lons, "
-          f"li range [{li.min()},{li.max()}], loi range [{loi.min()},{loi.max()}]")
-
     TP = np.zeros((nl, no)); FP = np.zeros((nl, no))
     FN = np.zeros((nl, no)); TN = np.zeros((nl, no))
     ps = np.zeros((nl, no)); pc = np.zeros((nl, no))
     has_data = np.zeros((nl, no), dtype=bool)
 
-    # ---- accumulate per-cell counts (this is what was missing) ----
-    # vectorised binning - much faster than a python loop over samples
+    # accumulate per-cell counts (vectorised binning)
     np.add.at(TP, (li, loi), (oc == "TP").astype(np.float64))
     np.add.at(FP, (li, loi), (oc == "FP").astype(np.float64))
     np.add.at(FN, (li, loi), (oc == "FN").astype(np.float64))
@@ -228,23 +202,12 @@ def _build_grids(lat, lon, y, proba, oc):
                 mean_prob=safe_div(ps, pc), has_data=has_data)
 
 
-def make_stype_for_year(year, ds_sds, unique_times, land_indices):
-    # parallel to make_target_for_year in data_utils - returns uint8 array of the same shape
-    # and ordering, so stype[k] aligns with y[k] and cache.X[year][k]
-    yr_start, yr_end = f"{year}-01-01", f"{year}-12-31"
-    sds_yr = ds_sds.sel(time=slice(yr_start, yr_end))
-    sds_yr = sds_yr.reindex(time=unique_times, fill_value=0)
-    vals = sds_yr["source_type"].values.astype(np.uint8)
-    parts = [vals[ti].ravel()[land_indices] for ti in range(vals.shape[0])]
-    return np.concatenate(parts)
-
-
 # ---------------------------------------------------------------------------
 # Basic plotting functions
 # ---------------------------------------------------------------------------
 def plot_feat_imp(feat_df, od, tag, name_map):
     # top 30 features by MDI, horizontal bar chart
-    print(f"  [01] Feature importance (MDI) ...")
+    print("  [01] Feature importance (MDI)")
     top = feat_df.head(30).iloc[::-1].copy()
     import re
     top["full_name"] = top["feature"].map(
@@ -258,7 +221,7 @@ def plot_feat_imp(feat_df, od, tag, name_map):
 
 def plot_roc_pr(y, proba, thr, od, tag):
     # ROC curve + precision-recall curve side by side
-    print("  [02] ROC + PR ...")
+    print("  [02] ROC + PR")
     fig,(a1,a2)=plt.subplots(1,2,figsize=(13,5.5))
     fpr,tpr,_=roc_curve(y,proba); auc=roc_auc_score(y,proba)
     a1.plot(fpr,tpr,color="#4472C4",lw=2,label=f"AUC = {auc:.4f}")
@@ -274,7 +237,7 @@ def plot_roc_pr(y, proba, thr, od, tag):
     fig.savefig(od/f"02_roc_pr_{tag}.png"); plt.close(fig)
 
 def plot_confusion(y, yp, od, tag):
-    print("  [03] Confusion matrix ...")
+    print("  [03] Confusion matrix")
     cm=confusion_matrix(y,yp); fig,ax=plt.subplots(figsize=(6.5,5.5))
     im=ax.imshow(cm,cmap="Blues",aspect="auto")
     for i in range(2):
@@ -288,7 +251,7 @@ def plot_confusion(y, yp, od, tag):
 
 def plot_prob_hist(proba, y, thr, od, tag):
     # overlaid histograms of predicted prob for pos/neg classes (linear + log)
-    print("  [04] Probability histogram ...")
+    print("  [04] Probability histogram")
     bins=np.linspace(0,1,101)
 
     fig,ax=plt.subplots(figsize=(10,5))
@@ -313,7 +276,7 @@ def plot_prob_hist(proba, y, thr, od, tag):
 
 def plot_outcome_prob_hist(proba, oc, thr, od, tag):
     # one subplot per outcome with summary stats - also dumps a CSV of the stats
-    print("  [04b] Outcome probability distributions ...")
+    print("  [04b] Outcome probability distributions")
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     pairs = [("TN",axes[0,0],"FP",axes[0,1]),("FN",axes[1,0],"TP",axes[1,1])]
     for oc1,ax1,oc2,ax2 in pairs:
@@ -353,7 +316,7 @@ def plot_outcome_prob_hist(proba, oc, thr, od, tag):
 
 def plot_calibration(y, proba, od, tag):
     # reliability diagram + prediction histogram - checks if probabilities are well-calibrated
-    print("  [05] Calibration ...")
+    print("  [05] Calibration")
     fig,(a1,a2)=plt.subplots(1,2,figsize=(13,5.5))
     fp,mp=calibration_curve(y,proba,n_bins=20,strategy="uniform")
     a1.plot(mp,fp,"o-",color="#4472C4",lw=2,label="Model")
@@ -368,7 +331,7 @@ def plot_calibration(y, proba, od, tag):
 
 def plot_threshold_tradeoff(y, proba, thr, od, tag):
     # precision, recall, accuracy & F1 at different thresholds 
-    print("  [06] Threshold tradeoff ...")
+    print("  [06] Threshold tradeoff")
     thresholds=np.linspace(0.01,0.99,200)
     f1s,precs,recs,accs=[],[],[],[]
     for t in thresholds:
@@ -412,17 +375,10 @@ def _kde_grid(X, groups, fnames, colors, labels, title, fname, od, name_map, max
         ax.set_yticks([]); ax.set_ylabel("Density",fontsize=TICK_SIZE - 2); ax.tick_params(labelsize=TICK_SIZE - 2)
     for j in range(i+1,len(axes)): axes[j].set_visible(False)
     handles=[Line2D([0],[0],color=colors[k],lw=2,label=labels[k]) for k in colors]
-    # Compact title+legend band at the top. tight_layout(rect=...) reserves the
-    # top 6% for chrome, then we place legend and suptitle inside that band in
-    # figure-fraction coords so they sit close together without dead space in
-    # between. The exact y values depend on how many rows the grid has - more
-    # rows means 6% of fig_h is a larger absolute gap, so we tighten proportionally.
-    # Rough rule: reserve ~0.7" for the chrome regardless of grid size.
+    # reserve ~0.8" at the top for legend + suptitle
     fig_h = fig.get_size_inches()[1]
     chrome_frac = min(0.08, 0.8 / fig_h)   # ~0.8" for title+legend, capped at 8% of fig
     plt.tight_layout(rect=[0, 0, 1, 1 - chrome_frac])
-    # Legend sits just above the top row; suptitle sits just above the legend.
-    # Both anchored in figure-fraction so they scale with fig_h.
     legend_y = 1 - chrome_frac * 0.55
     title_y  = 1 - chrome_frac * 0.15
     fig.legend(handles=handles, loc="center", ncol=min(len(colors), 6),
@@ -432,12 +388,12 @@ def _kde_grid(X, groups, fnames, colors, labels, title, fname, od, name_map, max
     fig.savefig(od/fname); plt.close(fig)
 
 def _best_grid(n):
-    # for nice arrangement of variable group sizes (no empty spots)
+    # grid layout without empty panels
     layout = {1: (1, 1), 2: (1, 2), 3: (1, 3), 4: (2, 2), 5: (2, 3), 6: (2, 3)}
     return layout.get(n, (int(np.ceil(n / 3)), 3))
 
 def _kde_group(X, groups, fnames_in_group, colors, labels, group_title, tag, od, name_map, prefix, feature_vars, max_per=100_000):
-    # helper to run kde for subgroups (to avoid the one huge plot)
+    # KDE grid for one feature group
     rng=np.random.default_rng(99)
     sampled={k:rng.choice(v,min(max_per,len(v)),replace=False) for k,v in groups.items() if len(v)>0}
     nf=len(fnames_in_group)
@@ -464,11 +420,7 @@ def _kde_group(X, groups, fnames_in_group, colors, labels, group_title, tag, od,
     for j in range(i+1,len(axes)): axes[j].set_visible(False)
     handles=[Line2D([0],[0],color=colors[k],lw=2,label=labels[k]) for k in colors]
     safe_title=group_title.replace("/","_").replace(" ","_").lower()
-    # Legend goes at the bottom here (different from the overview grid): these
-    # per-group plots have only a handful of subplots, so a bottom legend reads
-    # naturally and keeps the top of the figure clear for the suptitle + panel
-    # titles (which would otherwise get cramped by a top legend).
-    # Reserve space for suptitle (top) and legend (bottom), then anchor both.
+    # legend at the bottom, suptitle at the top
     fig_h = fig.get_size_inches()[1]
     top_chrome    = min(0.10, 0.55 / fig_h)   # ~0.55" for suptitle
     bottom_chrome = min(0.10, 0.45 / fig_h)   # ~0.45" for legend
@@ -483,7 +435,7 @@ def _kde_group(X, groups, fnames_in_group, colors, labels, group_title, tag, od,
 
 def plot_kde_by_class(X, y, od, tag, name_map, feature_vars):
     # splits by true label (0 vs 1) - shows which features separate the classes
-    print(f"  [07] KDE by class (overview + groups) ...")
+    print("  [07] KDE by class (overview + groups)")
     groups={0:np.where(y==0)[0], 1:np.where(y==1)[0]}
     colors={0:LABEL_COLORS[0], 1:LABEL_COLORS[1]}
     labels={0:"SDS Negative", 1:"SDS Positive"}
@@ -498,7 +450,7 @@ def plot_kde_by_class(X, y, od, tag, name_map, feature_vars):
 
 def plot_kde_by_outcome(X, oc, od, tag, name_map, feature_vars):
     # splits by confusion-matrix outcome - useful for seeing what distinguishes FPs from TNs etc.
-    print(f"  [08] KDE by outcome (overview + groups) ...")
+    print("  [08] KDE by outcome (overview + groups)")
     groups={o:np.where(oc==o)[0] for o in ["TN","FP","FN","TP"]}
     colors=OUTCOME_COLORS
     labels={"TN": "TN", "FP": "FP", "FN": "FN", "TP": "TP"}
@@ -517,14 +469,14 @@ def plot_kde_by_outcome(X, oc, od, tag, name_map, feature_vars):
 # ---------------------------------------------------------------------------
 def plot_spatial(G, od, tag):
     # per-cell F1/precision/recall on the map
-    print("  [09] Spatial metrics ...")
+    print("  [09] Spatial metrics")
     la,lo=G["lats"],G["lons"]
     for key,label in [("f1","F1"),("precision","Precision"),("recall","Recall")]:
         _mapplot(lo,la,G[key],f"{label} — {_tag_label(tag)}",F1_CMAP,0,1,
                  f"09_{key}_{tag}.png",od,label)
 
 def plot_count(G, od, tag):
-    print("  [10] Count maps ...")
+    print("  [10] Count maps")
     la, lo = G["lats"], G["lons"]
 
     cnt = G["total"].copy().astype(float); cnt[cnt == 0] = np.nan
@@ -541,24 +493,16 @@ def plot_count(G, od, tag):
              f"10c_prob_{tag}.png", od, "P(SDS=1)")
 
 def plot_outcome_count_maps(G, od, tag):
-    # per-cell TP / FP / FN counts on the map, using a perceptually uniform
-    # log-friendly colorscale so sparse and dense regions both read clearly.
-    print("  [10d] Outcome count maps (TP / FP / FN) ...")
+    # per-cell TP / FP / FN counts on the map
+    print("  [10d] Outcome count maps (TP / FP / FN)")
     la, lo = G["lats"], G["lons"]
 
-    # Each metric gets its own vmax so the color scale is not dominated by
-    # whichever outcome has the single highest cell count. Using the 98th
-    # percentile (ignoring zeros) keeps outlier cells from washing out the rest.
+    # own vmax per outcome (98th percentile of non-zero cells) so outliers don't wash out the scale
     def _vmax(arr):
         pos = arr[arr > 0]
         return float(np.percentile(pos, 98)) if len(pos) > 0 else 1.0
 
-    # Colormaps chosen to match the outcome color palette used elsewhere
-    # (OUTCOME_COLORS) while still giving a full luminance range:
-    #   TP  → greens  (correct detections, "good")
-    #   FP  → oranges (false alarms, "warning")
-    #   FN  → reds    (misses, "bad")
-    # Sequential perceptually-uniform cmaps so count differences are readable.
+    # sequential colormaps matching OUTCOME_COLORS: TP green, FP orange, FN red
     specs = [
         ("TP", G["TP"], "YlGn",     "TP count"),
         ("FP", G["FP"], "YlOrBr",   "FP count"),
@@ -580,7 +524,7 @@ def plot_outcome_count_maps(G, od, tag):
 # ---------------------------------------------------------------------------
 def plot_temporal(time, oc, od, tag):
     # daily TP/FP/FN counts + monthly F1/precision/recall
-    print("  [11] Temporal ...")
+    print("  [11] Temporal")
     df=pd.DataFrame({"time":pd.to_datetime(time),"outcome":oc})
     daily=df.groupby(["time","outcome"]).size().unstack(fill_value=0)
     for o in ["TP","FP","FN","TN"]:
@@ -588,7 +532,7 @@ def plot_temporal(time, oc, od, tag):
     fig,axes=plt.subplots(2,1,figsize=(16,9),sharex=True)
     for o in ["TP","FP","FN"]:
         axes[0].plot(daily.index,daily[o],color=OUTCOME_COLORS[o],label=o,lw=.9)
-    axes[0].set_ylabel("Count"); axes[0].set_title(f"Daily TP / FP / FN",fontsize=SUBTITLE_SIZE)
+    axes[0].set_ylabel("Count"); axes[0].set_title("Daily TP / FP / FN",fontsize=SUBTITLE_SIZE)
     axes[0].legend(); axes[0].grid(alpha=.2)
     df["month"]=df["time"].dt.to_period("M")
     mo=df.groupby(["month","outcome"]).size().unstack(fill_value=0)
@@ -607,7 +551,7 @@ def plot_temporal(time, oc, od, tag):
 
 def plot_seasonal(time, oc, od, tag):
     # month-of-year breakdown (aggregated across all years)
-    print("  [12] Seasonal ...")
+    print("  [12] Seasonal")
     df=pd.DataFrame({"time":pd.to_datetime(time),"outcome":oc}); df["month"]=df["time"].dt.month
     bm=df.groupby(["month","outcome"]).size().unstack(fill_value=0)
     for o in ["TP","FP","FN"]:
@@ -615,7 +559,7 @@ def plot_seasonal(time, oc, od, tag):
     fig,a1=plt.subplots(figsize=(12,5.5))
     bm[["TP","FP","FN"]].plot(kind="bar",ax=a1,color=[OUTCOME_COLORS[o] for o in ["TP","FP","FN"]],width=.7,alpha=OUTCOME_ALPHA)
     a1.set_xlabel("Month"); a1.set_ylabel("Count")
-    a1.set_xticklabels(["J","F","M","A","M","J","J","A","S","O","N","D"],rotation=0)
+    a1.set_xticklabels(["JFMAMJJASOND"[m-1] for m in bm.index],rotation=0)
     a2=a1.twinx()
     ts,fs,fns=bm["TP"].values,bm["FP"].values,bm["FN"].values
     f1s=safe_div(2*ts,2*ts+fs+fns)
@@ -633,7 +577,7 @@ def plot_seasonal(time, oc, od, tag):
 # ---------------------------------------------------------------------------
 def plot_stype_breakdown(y, yp, stype, od, tag):
     # counts of genesis/intermediate in the split + recall on each
-    print("  [13] Source-type breakdown ...")
+    print("  [13] Source-type breakdown")
     pos_mask = y == 1
     is_gen   = pos_mask & (stype == 1)
     is_int   = pos_mask & (stype == 2)
@@ -673,8 +617,7 @@ def plot_stype_breakdown(y, yp, stype, od, tag):
 
 def plot_stype_fraction_map(lats, lons, y, stype, od, tag):
     # per-cell fraction of positives that are genesis (vs intermediate)
-    # useful for seeing whether source composition varies regionally
-    print("  [14] Source-type fraction map ...")
+    print("  [14] Source-type fraction map")
     ul, ulo = np.sort(np.unique(lats)), np.sort(np.unique(lons))
     nl, no = len(ul), len(ulo)
     li  = np.searchsorted(ul,  lats)
@@ -699,12 +642,12 @@ def plot_stype_fraction_map(lats, lons, y, stype, od, tag):
 
 def plot_kde_by_stype(X, y, stype, od, tag, name_map, feature_vars):
     # restricted to positives - contrasts meteorology of genesis vs intermediate pixels
-    print("  [15] KDE by source type (overview + groups) ...")
+    print("  [15] KDE by source type (overview + groups)")
     pos_mask = y == 1
     gen_idx = np.where(pos_mask & (stype == 1))[0]
     int_idx = np.where(pos_mask & (stype == 2))[0]
     if len(gen_idx) < 10 or len(int_idx) < 10:
-        print("    too few genesis or intermediate samples, skipping KDE")
+        print("    skipped: too few genesis or intermediate samples")
         return
     groups = {1: gen_idx, 2: int_idx}
     _kde_grid(X, groups, feature_vars, STYPE_COLORS, STYPE_LABELS,
@@ -730,7 +673,7 @@ def _stype_count_grid(lats, lons, mask):
 def plot_spatial_by_stype(lats, lons, y, yp, stype, od, tag):
     # per-stype spatial breakdown - recall, TP count, FN count for each source type
     # plus a single shared FP map (FPs don't have a source type, they're truth=0)
-    print("  [16] Spatial maps split by source type ...")
+    print("  [16] Spatial maps split by source type")
     pos_mask = y == 1
     for st_val, st_label in STYPE_LABELS.items():
         tp_mask = pos_mask & (stype == st_val) & (yp == 1)
@@ -771,12 +714,12 @@ def plot_spatial_by_stype(lats, lons, y, yp, stype, od, tag):
 def plot_roc_recall_by_stype(y, proba, yp, stype, thr, od, tag):
     # two panels: (a) ROC curve per stype with shared negatives, (b) recall vs threshold per stype
     # shared negatives mean the FPR axis is comparable across stypes
-    print("  [17] ROC + recall-vs-threshold by source type ...")
+    print("  [17] ROC + recall-vs-threshold by source type")
     neg_mask = (y == 0)
     has_gen = ((y == 1) & (stype == 1)).sum() > 0
     has_int = ((y == 1) & (stype == 2)).sum() > 0
     if not (has_gen and has_int):
-        print("    need both genesis and intermediate positives, skipping")
+        print("    skipped: needs both genesis and intermediate positives")
         return
 
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5.5))
@@ -797,7 +740,7 @@ def plot_roc_recall_by_stype(y, proba, yp, stype, thr, od, tag):
     a1.set_title("ROC by source type", fontsize=SUBTITLE_SIZE)
     a1.legend(); a1.grid(alpha=.2)
 
-    # (b) recall vs threshold per stype - "how does sensitivity differ?"
+    # (b) recall vs threshold per stype
     thresholds = np.linspace(0.01, 0.99, 200)
     for st_val, st_label in STYPE_LABELS.items():
         mask = (y == 1) & (stype == st_val)
@@ -923,7 +866,7 @@ def _oc_cmap_norm_handles():
 
 def make_animation(lat, lon, y, oc, times, od, tag, fps=6):
     # mp4/gif animation cycling through each day
-    print(f"  [Anim] Building outcome animation for {_tag_label(tag)} ...")
+    print("  [Anim] Outcome animation")
     gp = _anim_grid_prep(lat, lon, times)
     oc_int = {"FP": 1, "FN": 2, "TP": 3}
     oc_map = np.array([oc_int.get(o, -1) for o in oc])
@@ -954,7 +897,7 @@ def save_daily_frames(lat, lon, oc, times, od, tag):
     oc_dir.mkdir(parents=True, exist_ok=True)
     n_days = len(gp["udays"])
     base_title = f"Daily SDS Predictions — {_tag_label(tag)}"
-    print(f"  [Frames] Saving {n_days} daily frames for {_tag_label(tag)} ...")
+    print(f"  [Frames] {n_days} daily outcome maps")
     for fi, day in enumerate(gp["udays"]):
         day_str = str(day)
         grid = _oc_grid_for_day(day, gp, oc_map)
@@ -970,25 +913,15 @@ def save_daily_frames(lat, lon, oc, times, od, tag):
             mline = (f"F1={metrics['f1']:.3f}  "
                      f"TP={metrics['tp']} FP={metrics['fp']} FN={metrics['fn']}")
         plt.tight_layout(rect=[0, 0, 1, 0.92])
-        # place metrics AFTER tight_layout so figure coords are stable.
-        # y=0.935 sits in the reserved top strip, just below the bold title (~0.955)
-        # and just above the top edge of the map axes (~0.92).
+        # metrics line between title and map (placed after tight_layout)
         fig.text(0.5, 0.935, mline,
                  ha="center", va="top",
                  fontsize=SUBTITLE_SIZE, fontweight="normal", color="#333333")
         fig.savefig(oc_dir / f"{day_str}.png"); plt.close(fig)
-        if (fi + 1) % 50 == 0 or fi == n_days - 1:
-            print(f"    {fi + 1}/{n_days} frames done")
-    print(f"    → {oc_dir}  ({n_days} files)")
 
 
 def _day_metrics(day, times, oc):
-    # F1/precision/recall + raw counts for a single day, using the same per-sample
-    # outcome labels that the map rendering uses. Returns a dict with floats (NaN
-    # where the metric is undefined) and ints for the counts. The caller decides
-    # how to display NaN (typically "n/a").
-    #
-    # conventions (match _build_grids):
+    # F1 / precision / recall + counts for one day, same conventions as _build_grids:
     #   - TP+FN == 0 and FP == 0  → F1/P/R all NaN (nothing happened, metric undefined)
     #   - TP+FN == 0 and FP >  0  → F1=0, P=0, R=NaN (model fired, no ground truth)
     #   - otherwise               → standard formulae
@@ -1020,58 +953,42 @@ def _day_metrics(day, times, oc):
 
 def plot_composite_frames(lat, lon, oc, times, dates, od, tag,
                           composite_title="SDS Prediction examples"):
-    # 2×3 grid of daily frames for hand-picked dates (passed as YYYY-MM-DD strings).
-    # Shares the per-day rendering logic with save_daily_frames/make_animation so the
-    # colours and outcome mapping stay identical; the difference is only layout and
-    # chrome (one figure title, one shared bottom legend, per-panel date subtitles).
-    #
-    # The function tolerates dates that aren't present in the split - those panels
-    # get a grey "no data" message instead of failing the whole plot, which makes it
-    # safe to run from both run_split calls (val + test) even when the dates only
-    # line up with one of them.
+    # 2x3 grid of daily frames for the given dates; dates missing from the split get an empty panel
     if not dates:
         return
-    print(f"  [Composite] Building composite frame plot for {_tag_label(tag)} ...")
+    print("  [Composite] Outcome maps for selected dates")
 
-    # parse user-supplied strings once. pd.to_datetime will raise on malformed input
-    # before any plotting happens, which is what we want (fail loudly at parse time).
+    # parse the dates once, before plotting
     try:
         parsed = [pd.to_datetime(d).date() for d in dates]
     except Exception as e:
-        print(f"    ERROR: could not parse dates {dates}: {e}")
+        print(f"    WARNING: could not parse dates {dates}: {e}")
         return
 
-    # filter to the dates that actually exist in this split. a date absent from the
-    # split isn't necessarily a bug - it might belong to the other split - so we warn
-    # and continue with an empty panel rather than aborting.
+    # a date may belong to the other split: warn and leave its panel empty
     gp = _anim_grid_prep(lat, lon, times)
     available = set(gp["udays"].tolist())
     matched = [d for d in parsed if d in available]
     missing = [d for d in parsed if d not in available]
     if not matched:
-        print(f"    no requested dates fall in {_tag_label(tag)} "
-              f"(requested: {', '.join(str(d) for d in parsed)}) - skipping")
+        print(f"    skipped: none of the dates fall in {_tag_label(tag)}")
         return
     if missing:
-        print(f"    note: {len(missing)} date(s) not in this split, leaving those "
-              f"panels blank: {', '.join(str(d) for d in missing)}")
+        print(f"    {len(missing)} date(s) not in this split, panels left blank: "
+              f"{', '.join(str(d) for d in missing)}")
 
     oc_int = {"FP": 1, "FN": 2, "TP": 3}
     oc_map = np.array([oc_int.get(o, -1) for o in oc])
     cmap, norm, handles = _oc_cmap_norm_handles()
 
-    # pin the layout to exactly 2×3 regardless of how many dates were supplied - if
-    # the caller gives fewer than 6, the remaining slots render blank with a note;
-    # more than 6 get truncated (with a warning) so the figure shape stays predictable.
+    # always a 2x3 layout: unused slots stay blank, extra dates are dropped
     nr, nc = 2, 3
     n_slots = nr * nc
     if len(parsed) > n_slots:
-        print(f"    warning: {len(parsed)} dates supplied, only first {n_slots} will be shown")
+        print(f"    WARNING: {len(parsed)} dates given, only the first {n_slots} are shown")
         parsed = parsed[:n_slots]
 
-    # figure geometry: each panel keeps the single-frame aspect ratio (lat/lon of
-    # DOMAIN). We size based on lon_range so the overall figure stays readable, then
-    # reserve headroom for suptitle and footer for the legend.
+    # panels keep the map aspect ratio; extra height for suptitle and legend
     lon_range = DOMAIN["east"] - DOMAIN["west"]
     lat_range = DOMAIN["north"] - DOMAIN["south"]
     panel_w = 5.0                              # inches per panel (width)
@@ -1081,8 +998,6 @@ def plot_composite_frames(lat, lon, oc, times, dates, od, tag,
 
     fig = plt.figure(figsize=(fig_w, fig_h))
 
-    # padding in figure fraction. bottom_pad leaves room for the single-row legend;
-    # top_pad gives the suptitle breathing room without cramping the top row of panels.
     left_pad   = 0.035
     right_pad  = 0.035
     bottom_pad = 0.09
@@ -1092,9 +1007,7 @@ def plot_composite_frames(lat, lon, oc, times, dates, od, tag,
     grid_h = top_pad - bottom_pad
     cell_w = grid_w / nc
     cell_h = grid_h / nr
-    # shrink each panel slightly so neighbours don't touch; the gap also gives the
-    # gridline tick labels + the two-line subtitle (date + F1 metrics) somewhere to
-    # live without overlapping the next panel.
+    # small gap between panels for tick labels and the two-line subtitles
     inner_w = cell_w * 0.92
     inner_h = cell_h * 0.78
     dx = (cell_w - inner_w) / 2
@@ -1143,11 +1056,7 @@ def plot_composite_frames(lat, lon, oc, times, dates, od, tag,
             ax.pcolormesh(gp["lo2"], gp["la2"], grid, cmap=cmap, norm=norm,
                           shading="auto", alpha=OUTCOME_ALPHA, zorder=1,
                           transform=ccrs.PlateCarree())
-            # two-line title: date + per-day metrics. Using a single title with
-            # an embedded \n keeps the panel's plotting area untouched - matplotlib
-            # grows the title box upwards rather than eating into the axes. "n/a"
-            # fallback mirrors _day_metrics' NaN convention for days with no
-            # positives and no FPs (F1 is undefined there).
+            # date + metrics as a two-line title (n/a where F1 is undefined)
             metrics = _day_metrics(day, times, oc)
             if np.isnan(metrics["f1"]):
                 mline = f"F1=n/a  TP={metrics['tp']} FP={metrics['fp']} FN={metrics['fn']}"
@@ -1157,8 +1066,6 @@ def plot_composite_frames(lat, lon, oc, times, dates, od, tag,
             ax.set_title(f"{day}\n{mline}",
                          fontsize=SUBPLOT_TITLE_SIZE, pad=4)
 
-    # suptitle + single-row legend. the legend sits just above the bottom edge in
-    # figure coords, and the bottom_pad above gives it the vertical space it needs.
     fig.suptitle(f"{composite_title} — {_tag_label(tag)}",
                  fontsize=TITLE_SIZE, fontweight="bold",
                  y=0.965)
@@ -1171,7 +1078,6 @@ def plot_composite_frames(lat, lon, oc, times, dates, od, tag,
 
     out = od / f"composite_frames_{tag}.png"
     fig.savefig(out); plt.close(fig)
-    print(f"    → {out}")
 
 
 # ---------------------------------------------------------------------------
@@ -1182,7 +1088,7 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
               model_dir, no_animation=False, frames_only=False,
               composite_only=False, composite_dates=None):
     # runs the full plotting pipeline for one split (val or test)
-    print(f"\n{'='*60}\nAnalysing: {_tag_label(tag)}\n{'='*60}")
+    section(_tag_label(tag))
     years = list(range(split_years[0], split_years[1] + 1))
 
     # if available loads saved predictions
@@ -1190,17 +1096,15 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
     predictions_loaded = False
 
     if pred_file.exists():
-        print(f"  Loading saved predictions from {pred_file} ...")
         saved = np.load(pred_file)
         y     = saved["y"].astype(np.float32)
         proba = saved["proba"].astype(np.float32)
         predictions_loaded = True
-        print(f"  Loaded {len(y):,} samples ({int(y.sum()):,} pos)")
 
     # reconstruct coordinates (needed for spatial/temporal plots)
     all_pos, all_neg = collect_indices(
         cache, years, ds_sds, sds_var, land_indices,
-        logging.getLogger("analyze"))
+        logging.getLogger("analyze"), label=_tag_label(tag))
     all_indices = all_pos + all_neg
 
     # pull lat/lon/time from each year's feature netcdf
@@ -1222,7 +1126,7 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
 
     # redo predictions if no saved ones found
     if not predictions_loaded:
-        print("  No saved predictions found — running inference ...")
+        print(f"  WARNING: {pred_file.name} not found, predicting again")
         X_inf = extract_from_cache(cache, all_indices)
         y = np.concatenate([
             np.ones(len(all_pos),  dtype=np.float32),
@@ -1234,16 +1138,17 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
         del X_inf, proba_raw
         gc.collect()
 
-    print(f"  Samples: {len(y):,} ({int(y.sum()):,} pos)")
+    if len(y) != len(all_indices):
+        sys.exit(f"ERROR: {pred_file.name} has {len(y):,} samples but the {tag} split has "
+                 f"{len(all_indices):,}; the saved predictions do not match these features")
     yp = (proba >= thr).astype(np.int32)
     oc = outcome_labels(y, yp)
     cm = confusion_matrix(y, yp); tn, fp, fn, tp = cm.ravel()
-    print(f"  TP={tp:,} FP={fp:,} FN={fn:,} TN={tn:,}")
-    print(f"  F1={f1_score(y,yp):.4f} P={precision_score(y,yp):.4f} R={recall_score(y,yp):.4f}")
+    print(f"  F1={f1_score(y,yp):.4f} P={precision_score(y,yp):.4f} R={recall_score(y,yp):.4f} "
+          f"(TP={tp:,} FP={fp:,} FN={fn:,})")
 
     # source-type lookup (1=genesis, 2=intermediate, 0=neither)
-    # Skipped in composite-only mode since the composite plot doesn't use stype,
-    # and re-reading the SDS source dataset year-by-year is slow.
+    # (skipped in composite-only mode: slow and not needed there)
     if not composite_only:
         stype_by_year = {
             year: make_stype_for_year(year, ds_sds,
@@ -1254,13 +1159,10 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
         for i, (year, idx) in enumerate(all_indices):
             stype[i] = stype_by_year[year][idx]
         del stype_by_year
-        n_gen = int(((y == 1) & (stype == 1)).sum())
-        n_int = int(((y == 1) & (stype == 2)).sum())
-        print(f"  Positives: {n_gen:,} genesis + {n_int:,} intermediate")
     else:
-        stype = None  # downstream del handles None safely via the guard below
+        stype = None
 
-    # get long (nice) name from short name
+    # display names
     name_map = get_feature_name_map(feature_vars)
 
     if not frames_only and not composite_only:
@@ -1280,9 +1182,6 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
         del X; gc.collect()
 
         G = _build_grids(lats,lons,y,proba,oc)
-        print(f"  G sanity: total sum={G['total'].sum():.0f}, "
-            f"TP sum={G['TP'].sum():.0f}, FP sum={G['FP'].sum():.0f}, "
-            f"FN sum={G['FN'].sum():.0f}, cells with data={G['has_data'].sum()}")
         plot_spatial(G,od,tag)
         plot_count(G,od,tag)
         plot_outcome_count_maps(G, od, tag) 
@@ -1298,8 +1197,7 @@ def run_split(tag, cache, split_years, ds_sds, sds_var, land_indices,
         make_animation(lats, lons, y, oc, times, od, tag)
         save_daily_frames(lats, lons, oc, times, od, tag)
 
-    # composite plot is cheap and useful even in frames_only / no_animation modes,
-    # so it runs independently of the animation/frames toggles
+    # the composite plot runs regardless of the animation / frames flags
     if composite_dates:
         plot_composite_frames(lats, lons, oc, times, composite_dates, od, tag)
 
@@ -1325,20 +1223,18 @@ def main():
         help="up to 6 dates (YYYY-MM-DD) to render as a 2x3 composite frame plot. "
              "Dates not in the current split are skipped with a warning, so it's "
              "fine to pass dates that belong to just val or just test.")
-    parser.add_argument("--out_dir",type=str,default=None)
+    parser.add_argument("--fig_dir",type=str,default=None,
+                        help="figure folder (default: figures/model/<model>/analysis)")
     args=parser.parse_args()
-    # --composite_only is mutually exclusive with the other "only"/"no" flags, and
-    # needs dates to be meaningful (otherwise the whole run produces nothing).
+    # --composite_only needs --composite_dates and excludes the other mode flags
     only_flags = sum([args.frames_only, args.no_animation, args.composite_only])
     if only_flags > 1:
-        print("ERROR: --frames_only, --no_animation, and --composite_only are mutually exclusive")
-        sys.exit(1)
+        sys.exit("ERROR: --frames_only, --no_animation, and --composite_only are mutually exclusive")
     if args.composite_only and not args.composite_dates:
-        print("ERROR: --composite_only requires --composite_dates")
-        sys.exit(1)
-    model_dir=Path(args.model_dir)
+        sys.exit("ERROR: --composite_only requires --composite_dates")
+    model_dir=resolve_path(args.model_dir)
 
-    if not model_dir.exists(): print(f"ERROR: {model_dir}"); sys.exit(1)
+    if not model_dir.exists(): sys.exit(f"ERROR: model_dir not found: {model_dir}")
     # read model
     rf=joblib.load(model_dir/"rf_model.joblib")
     pp=model_dir/"platt_scaler.joblib"
@@ -1347,26 +1243,28 @@ def main():
     feat_df=pd.read_csv(model_dir/"feature_importances.csv")
     thr=results["threshold"]; feature_vars=results["feature_vars"]; dc=results["data_config"]
 
-    # CLI args override, otherwise fall back to the values saved in results.json, otherwise to the config defaults
+    # CLI args > values saved in results.json > config defaults
     resolution=args.resolution or dc.get("resolution",RESOLUTION)
     spatial_res=args.spatial or dc.get("spatial_res",SPATIAL_RES)
     val_years=args.val_years or dc.get("val_years",VAL_YEARS)
     test_years=args.test_years or dc.get("test_years",TEST_YEARS)
-    sds_path=args.sds_path or dc.get("sds_path") or SDS_PATH
+    sds_path=resolve_path(args.sds_path or dc.get("sds_path") or SDS_PATH)
 
     _YEAR_RANGES["val"]  = tuple(val_years)
     _YEAR_RANGES["test"] = tuple(test_years)
 
-    if sds_path is None: print("ERROR: No SDS path"); sys.exit(1)
-
     sds_file=Path(sds_path)
-    od=Path(args.out_dir) if args.out_dir else model_dir/"analysis"
+    if not sds_file.exists(): sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
+    od=Path(args.fig_dir) if args.fig_dir else model_figures_dir(model_dir,"analysis")
     od.mkdir(parents=True,exist_ok=True)
 
     logging.basicConfig(level=logging.INFO,format="%(message)s")
 
-    print("="*60); print(f"RF ANALYSIS — {model_dir}"); print(f"  Threshold: {thr:.4f}")
-    print(f"  Output: {od}"); print("="*60)
+    header("Random forest analysis", {
+        "Model": project_relative(model_dir),
+        "Threshold": f"{thr:.4f}",
+        "Output": project_relative(od),
+    })
 
     cache=FeatureCache(resolution=resolution,spatial_res=spatial_res,
                        val_years=val_years,test_years=test_years,logger=logging.getLogger("analyze"))
@@ -1382,6 +1280,6 @@ def main():
                   composite_dates=args.composite_dates)
     ds_sds.close()
 
-    print(f"\n{'='*60}\nANALYSIS COMPLETE — {od}\n{'='*60}")
+    done(od)
 
 if __name__=="__main__": main()

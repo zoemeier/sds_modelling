@@ -1,6 +1,6 @@
 """
 Submit NDVI (MODIS MOD13A1.061) area requests to the NASA AppEEARS API,
-one task per year (2015-2024).
+one task per year (config.YEARS).
 
 This script only submits requests. Once they are processed (you'll get an
 email), run download_ndvi.py to fetch the resulting bundles.
@@ -10,16 +10,18 @@ Reference:
 """
 
 import requests as r
-from pathlib import Path
 import json
 
 
-START_YEAR = 2015
-END_YEAR = 2024
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PW_PATH = PROJECT_ROOT / "passwords.json"
+from sds.config import YEARS, DOMAIN, ERA5_NATIVE_RES, PASSWORDS_FILE as PW_PATH
+from sds.log_utils import header, done
+
+# domain extended by half a 0.25° cell, so the outer grid cells are fully covered
+PAD = ERA5_NATIVE_RES / 2
+W, E = DOMAIN["west"] - PAD, DOMAIN["east"] + PAD
+S, N = DOMAIN["south"] - PAD, DOMAIN["north"] + PAD
 with open(PW_PATH) as f:
     pws = json.load(f)
 
@@ -44,21 +46,19 @@ bounding_box = {
         "geometry": {
             "type": "Polygon",
             "coordinates": [[
-                [-18.125, -0.125],
-                [-18.125, 50.125],
-                [85.125, 50.125],
-                [85.125, -0.125],
-                [-18.125, -0.125],
+                [W, S], [W, N], [E, N], [E, S], [W, S],
             ]],
         },
     }],
 }
 
 
-for year in range(START_YEAR, END_YEAR + 1):
+header("NDVI request (AppEEARS)", {"Years": f"{min(YEARS)}-{max(YEARS)}"})
+
+for year in YEARS:
     task = {
         'task_type': 'area',
-        'task_name': f"{year}-ndvi-big",
+        'task_name': f"{year}-ndvi",
         'params': {
             'dates': [{
                 'startDate': f"01-01-{year}",
@@ -71,4 +71,6 @@ for year in range(START_YEAR, END_YEAR + 1):
     }
 
     task_response = r.post(f'{api}task', json=task, headers=head).json()
-    print(f"Year {year} task submitted: {task_response}")
+    print(f"  Submitted: {year}-ndvi ({task_response})")
+
+done("run download_ndvi.py once AppEEARS has emailed that the tasks are done")

@@ -12,17 +12,19 @@ import sys
 import logging
 import gc
 import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from config import (
-    PROJECT_ROOT, DATA_PATH, ERA5_PATH, NDVI_PATH, ACLED_PATH, SOIL_PATH,
-    OUT_PATH, LAND_MASK_FILE, LSM_THRESHOLD, TEMPORAL_TAG,
-    spatial_tag, file_tag, should_drop_feature,
+from sds.config import (
+    RESOLUTION, SPATIAL_RES, SUPPORTED_SPATIAL_RES, YEARS,
+    LOGS_PATH, INTERIM_PATH, NDVI_PATH, ACLED_PATH,
+    SOIL_PATH, OUT_PATH,
 )
+from sds.paths import TEMPORAL_TAG, spatial_tag, file_tag, project_relative, YEARS_TAG, ACLED_YEARS_TAG
+from sds.log_utils import header, done
+from sds.data_utils import should_drop_feature, load_land_mask
 
 
 def setup_logging(log_file=None):
@@ -67,45 +69,33 @@ def normalise_coords(ds):
     return ds
 
 
-def load_land_mask(target_lat, target_lon):
-    lsm_ds = xr.open_dataset(LAND_MASK_FILE, engine="cfgrib").squeeze()
-    lsm_var = next((v for v in ("lsm", "land_sea_mask", "LSM") if v in lsm_ds),
-                   list(lsm_ds.data_vars)[0])
-    lsm = lsm_ds[lsm_var]
-    lsm = lsm.sel(latitude=target_lat, longitude=target_lon, method="nearest")
-    mask = (lsm.values > LSM_THRESHOLD).astype(bool)
-    lsm_ds.close()
-    return mask
-
-
 def prepare_features(resolution, spatial_res, years):
     """Prepare flat feature files, dropping unwanted variables."""
     ftag = file_tag(resolution, spatial_res)
     stag = spatial_tag(spatial_res)
-    ttag = TEMPORAL_TAG[resolution]
 
     out_dir = OUT_PATH / ftag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log_file = PROJECT_ROOT / "logs" / f"prepare_features_{ftag}.log"
+    log_file = LOGS_PATH / f"prepare_features_{ftag}.log"
     logger = setup_logging(log_file)
 
-    logger.info("=" * 60)
-    logger.info(f"PREPARE FEATURES: {ftag}")
-    logger.info(f"  Years: {years}")
-    logger.info("=" * 60)
+    header("Model features", {
+        "Resolution": f"{resolution}, {spatial_res}°",
+        "Years": f"{min(years)}-{max(years)}" if len(years) > 1 else str(years[0]),
+        "Output": project_relative(out_dir),
+    }, out=logger.info)
 
     # ── Open source datasets lazily ───────────────────────────────────────
-    era5_file = ERA5_PATH / f"era5_features_2015_2024_{ftag}.nc"
-    ndvi_file = NDVI_PATH / f"NDVI_2015-2024_{ftag}.nc"
-    acled_file = ACLED_PATH / f"ACLED_2014-2024_{ftag}.nc"
-    soil_file = SOIL_PATH / f"soil_2015-2024_{stag}.nc"
+    era5_file = INTERIM_PATH / f"era5_features_{YEARS_TAG.replace('-', '_')}_{ftag}.nc"
+    ndvi_file = NDVI_PATH / f"NDVI_{YEARS_TAG}_{ftag}.nc"
+    acled_file = ACLED_PATH / f"ACLED_{ACLED_YEARS_TAG}_{ftag}.nc"
+    soil_file = SOIL_PATH / f"soil_{YEARS_TAG}_{stag}.nc"
 
     for f, name in [(era5_file, "ERA5"), (ndvi_file, "NDVI"),
                     (acled_file, "ACLED"), (soil_file, "Soil")]:
         if not f.exists():
-            logger.error(f"  {name} file not found: {f}")
-            sys.exit(1)
+            sys.exit(f"ERROR: {name} file not found: {f} (run the preprocessing first)")
 
     ds_era5 = normalise_coords(normalise_time(
         xr.open_dataset(era5_file, chunks={"time": 365})
@@ -142,23 +132,19 @@ def prepare_features(resolution, spatial_res, years):
     # drop unwanted features
     kept_features = [v for v in all_feature_names if not should_drop_feature(v)]
     dropped = [v for v in all_feature_names if should_drop_feature(v)]
-    logger.info(f"  Total features before drop: {len(all_feature_names)}")
-    logger.info(f"  Dropped features ({len(dropped)}): {dropped}")
-    logger.info(f"  Kept features ({len(kept_features)}): {len(kept_features)}")
+    logger.info(f"  Features: {len(kept_features)}"
+                + (f" ({len(dropped)} dropped: {', '.join(dropped)})" if dropped else ""))
 
     # land mask
     land_mask = load_land_mask(ref_lat, ref_lon)
-    n_land = int(land_mask.sum())
-    logger.info(f"  Land cells: {n_land:,} / {land_mask.size:,}")
 
     # process yearly files
     for year in years:
         out_file = out_dir / f"features_{year}_{ftag}.nc"
         if out_file.exists():
-            logger.info(f"  {year}: already exists, skipping")
+            logger.info(f"  Already exists: {out_file.name}")
             continue
 
-        logger.info(f"\n  Processing {year} ...")
         yr_start, yr_end = f"{year}-01-01", f"{year}-12-31"
 
         era5_yr = ds_era5.sel(time=slice(yr_start, yr_end)).load()
@@ -212,10 +198,7 @@ def prepare_features(resolution, spatial_res, years):
 
         encoding = {v: {"zlib": True, "complevel": 4} for v in ds_flat.data_vars}
         ds_flat.to_netcdf(out_file, engine="h5netcdf", encoding=encoding)
-        n_valid = len(times)
-        size_mb = out_file.stat().st_size / (1024 * 1024)
-        logger.info(f"    Done — {size_mb:.1f} MB, {n_valid:,} samples, "
-                    f"{len(list(ds_flat.data_vars))} vars")
+        logger.info(f"  Saved: {out_file.name} ({len(times):,} samples)")
 
         del era5_yr, ndvi_yr, acled_yr, ds_yr, ds_flat
         gc.collect()
@@ -229,19 +212,19 @@ def prepare_features(resolution, spatial_res, years):
         "feature_names": kept_features,
         "dropped_features": dropped,
         "years": years,
-        "files": {y: str(out_dir / f"features_{y}_{ftag}.nc") for y in years},
+        "files": {y: project_relative(out_dir / f"features_{y}_{ftag}.nc") for y in years},
     }
     manifest_path = out_dir / f"features_manifest_{ftag}.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    logger.info(f"\nManifest: {manifest_path}")
-    logger.info("FEATURE PREPARATION COMPLETE")
+    done(out_dir, out=logger.info)
     return manifest_path
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resolution", "-r", choices=["daily", "6h", "3h"], default="daily")
-    parser.add_argument("--spatial", "-s", type=float, choices=[0.25, 0.75], default=0.25)
-    parser.add_argument("--years", nargs="+", type=int, required=True)
+    parser.add_argument("--resolution", "-r", choices=list(TEMPORAL_TAG), default=RESOLUTION)
+    parser.add_argument("--spatial", "-s", type=float, choices=SUPPORTED_SPATIAL_RES, default=SPATIAL_RES)
+    parser.add_argument("--years", nargs="+", type=int, default=list(YEARS),
+                        help="years to prepare (default: config.YEARS)")
     args = parser.parse_args()
     prepare_features(args.resolution, args.spatial, args.years)

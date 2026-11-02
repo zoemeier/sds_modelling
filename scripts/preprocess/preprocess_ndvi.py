@@ -23,7 +23,6 @@ import os
 import gc
 import argparse
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -33,14 +32,15 @@ from dask.diagnostics import ProgressBar
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-from grid_config import (
-    RESOLUTION_CONFIG, YEARS, make_target_grid, file_tag, spatial_tag,
+from sds.config import (
+    ERA5_NATIVE_RES, CAMS_NATIVE_RES, SUPPORTED_SPATIAL_RES, RESOLUTION,
+    SPATIAL_RES, RESOLUTION_CONFIG, YEARS, NDVI_PATH,
 )
+from sds.paths import file_tag, spatial_tag, YEARS_TAG
+from sds.grid import make_target_grid
+from sds.log_utils import header, section, done
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH = PROJECT_ROOT / "data"
-NDVI_PATH = DATA_PATH / "ndvi"
 os.makedirs(NDVI_PATH, exist_ok=True)
 
 EDGE_FILL_LIMIT_DAYS = 32
@@ -51,23 +51,17 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
     """Quality-filter MODIS 500m NDVI and regrid to the target spatial grid."""
     stag = spatial_tag(spatial_res)
 
-    print("=" * 70)
-    print(f"STEP 1: Quality-filter MODIS 500m + regrid → {spatial_res}°")
-    print("=" * 70)
-
     # 0.75°: coarsen from 0.25° per-year files
-    if spatial_res == 0.75:
-        stag_025 = spatial_tag(0.25)
+    if spatial_res == CAMS_NATIVE_RES:
+        stag_025 = spatial_tag(ERA5_NATIVE_RES)
         all_025_exist = all(
             (NDVI_PATH / f"NDVI_{y}_{stag_025}.nc").exists() for y in years
         )
         if not all_025_exist:
-            print(f"\n  0.25° per-year files missing — running Step 1 at 0.25° first")
-            lat_025, lon_025 = make_target_grid(0.25)
-            step1_filter_and_regrid(0.25, lat_025, lon_025, years=years)
-            print(f"\n  Resuming 0.75° coarsening ...\n")
+            lat_025, lon_025 = make_target_grid(ERA5_NATIVE_RES)
+            step1_filter_and_regrid(ERA5_NATIVE_RES, lat_025, lon_025, years=years)
 
-        print(f"  Coarsening 0.25° → 0.75° (3×3 mean)")
+        section(f"Step 1: Coarsen {ERA5_NATIVE_RES}° → {spatial_res}° (3 × 3 mean)")
         for year in years:
             output_file = NDVI_PATH / f"NDVI_{year}_{stag}.nc"
             if output_file.exists():
@@ -76,10 +70,9 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
 
             src_file = NDVI_PATH / f"NDVI_{year}_{stag_025}.nc"
             if not src_file.exists():
-                print(f"  {src_file.name} not found — skipping")
+                print(f"  Missing: {src_file.name} (skipped)")
                 continue
 
-            print(f"  Coarsening {year} ...")
             ds_025 = xr.open_dataset(src_file)
             lat_dim = "latitude" if "latitude" in ds_025.dims else "lat"
             lon_dim = "longitude" if "longitude" in ds_025.dims else "lon"
@@ -94,7 +87,6 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
                     {lat_dim: (0, pad_lat), lon_dim: (0, pad_lon)},
                     mode="constant", constant_values=np.nan,
                 )
-                print(f"    Padded +{pad_lat} lat, +{pad_lon} lon for even division")
 
             ds_075 = ds_025.coarsen(
                 {lat_dim: 3, lon_dim: 3}, boundary="exact"
@@ -112,12 +104,13 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
                 )
 
             ds_075 = ds_075.assign_coords(latitude=target_lat, longitude=target_lon)
+            print(f"  Saving: {output_file.name}")
             ds_075.to_netcdf(output_file, engine="h5netcdf")
-            print(f"  Saved {output_file.name}")
             ds_025.close()
         return
 
     # 0.25°: quality-filter and coarsen 60x60 from native MODIS 500m
+    section(f"Step 1: Quality-filter MODIS 500 m and regrid → {spatial_res}°")
     dlat = spatial_res / 2
     dlon = spatial_res / 2
     lat_sorted = np.sort(target_lat)
@@ -132,12 +125,12 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
             print(f"  Already exists: {output_file.name}")
             continue
 
-        input_file = NDVI_PATH / f"{year}-ndvi-big" / "MOD13A1.061_500m_aid0001.nc"
+        input_file = NDVI_PATH / f"{year}-ndvi" / "MOD13A1.061_500m_aid0001.nc"
         if not input_file.exists():
-            print(f"  {input_file.name} not found — skipping")
+            print(f"  Missing: {input_file.relative_to(NDVI_PATH)} (skipped)")
             continue
 
-        print(f"\n  Processing {year}")
+        print(f"  Processing {year} ...")
         ds = xr.open_dataset(
             input_file, chunks={"lat": "auto", "lon": "auto", "time": 1}
         )
@@ -148,7 +141,6 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
         # MODIS lat is descending → use LAT_MAX first in slice
         ndvi = ndvi.sel(lat=slice(LAT_MAX, LAT_MIN), lon=slice(LON_MIN, LON_MAX))
         qa   = qa.sel(lat=slice(LAT_MAX, LAT_MIN), lon=slice(LON_MIN, LON_MAX))
-        print(f"  Clipped: {len(ndvi.lat)}×{len(ndvi.lon)}")
 
         modland_qa    = qa & 0b11
         vi_usefulness = (qa >> 2) & 0b1111
@@ -162,7 +154,6 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
         ndvi_std  = ndvi_valid.coarsen(lat=60, lon=60).std(skipna=True)
         snow_frac = snow_ice.coarsen(lat=60, lon=60).mean()
 
-        print(f"  Computing ...")
         with ProgressBar():
             ndvi_mean_r, ndvi_std_r, snow_frac_r = dask.compute(
                 ndvi_mean, ndvi_std, snow_frac
@@ -191,11 +182,8 @@ def step1_filter_and_regrid(spatial_res, target_lat, target_lon, years=YEARS):
 
         n_total = np.prod(ds_out["NDVI_mean"].shape)
         n_nan = int(np.isnan(ds_out["NDVI_mean"].values).sum())
-        print(f"  {year}: {n_nan:,} / {n_total:,} NaN cells "
-              f"({100 * n_nan / n_total:.1f}%) after coarsening")
-
+        print(f"  Saving: {output_file.name} ({100 * n_nan / n_total:.1f}% NaN cells)")
         ds_out.to_netcdf(output_file, engine="h5netcdf")
-        print(f"  Saved to {output_file}")
         ds.close()
         gc.collect()
 
@@ -206,11 +194,9 @@ def step2_combine_and_interpolate(ttag, ftag, spatial_res, years=YEARS):
 
     stag = spatial_tag(spatial_res)
 
-    print("\n" + "=" * 70)
-    print(f"STEP 2: Combine NDVI {spatial_res}° composites → {ttag}")
-    print("=" * 70)
+    section(f"Step 2: Combine years and interpolate 16-day composites → {ttag}")
 
-    output_file = NDVI_PATH / f"NDVI_2015-2024_{ftag}.nc"
+    output_file = NDVI_PATH / f"NDVI_{YEARS_TAG}_{ftag}.nc"
     if output_file.exists():
         print(f"  Already exists: {output_file.name}")
         return
@@ -236,9 +222,6 @@ def step2_combine_and_interpolate(ttag, ftag, spatial_res, years=YEARS):
     if rename_map:
         ds_ndvi = ds_ndvi.rename(rename_map)
 
-    n_composites = len(ds_ndvi.time)
-    print(f"  Loaded {n_composites} composites at {spatial_res}°")
-
     LAT = ds_ndvi["latitude"].values
     LON = ds_ndvi["longitude"].values
 
@@ -249,15 +232,12 @@ def step2_combine_and_interpolate(ttag, ftag, spatial_res, years=YEARS):
     except (TypeError, ValueError):
         composite_times = np.array([np.datetime64(str(t)[:19]) for t in composite_times])
         ds_ndvi["time"] = composite_times
-        print(f"  Converted cftime → numpy datetime64")
 
-    freq_map = {"daily": "D", "6hourly": "6h", "3hourly": "3h"}
-    freq = freq_map.get(ttag, "D")
+    freq = {c["tag"]: c["rule"] for c in RESOLUTION_CONFIG.values()}[ttag]
     start_dt = pd.Timestamp(f"{years[0]}-01-01")
     end_dt   = pd.Timestamp(f"{years[-1]}-12-31")
     target_index = pd.date_range(start=start_dt, end=end_dt, freq=freq)
     NT = len(target_index)
-    print(f"  Target: {NT} {ttag} steps")
 
     times_f64 = nc4.date2num(
         target_index.to_pydatetime(),
@@ -323,42 +303,37 @@ def step2_combine_and_interpolate(ttag, ftag, spatial_res, years=YEARS):
             total_nan[vname] += int(np.isnan(arr).sum())
         total_cells += n_yr * len(LAT) * len(LON)
 
-        pct = 100 * (yi + 1) / len(years)
-        print(f"  {year} written ({n_yr} steps, {pct:.0f}% done)")
+        print(f"  {year} written ({yi + 1}/{len(years)})")
 
     ncf.close()
     ds_ndvi.close()
 
-    print(f"\n  After interpolation + edge fill:")
-    for vname in ["NDVI_mean", "NDVI_std", "snow_frac"]:
-        nn = total_nan[vname]
-        pct = 100 * nn / total_cells if total_cells > 0 else 0
-        print(f"    {vname}: {nn:,} / {total_cells:,} NaN ({pct:.2f}%)")
-    print(f"  Done: {output_file}")
+    print("  NaN after interpolation: " + ", ".join(
+        f"{v} {100 * total_nan[v] / max(total_cells, 1):.2f}%" for v in nc_vars))
 
 
-def run_ndvi_preprocessing(resolution="1D", spatial_res=0.25):
+def run_ndvi_preprocessing(resolution=RESOLUTION, spatial_res=SPATIAL_RES):
     cfg  = RESOLUTION_CONFIG[resolution]
     ttag = cfg["tag"]
-    ftag = file_tag(ttag, spatial_res)
+    ftag = file_tag(resolution, spatial_res)
     target_lat, target_lon = make_target_grid(spatial_res)
 
-    print(f"\n{'#' * 70}")
-    print(f"  NDVI preprocessing")
-    print(f"  Temporal: {resolution} ({ttag})  |  Spatial: {spatial_res}°")
-    print(f"  File tag: {ftag}  |  Grid: {len(target_lat)}×{len(target_lon)}")
-    print(f"{'#' * 70}\n")
+    header("NDVI preprocessing", {
+        "Resolution": f"{resolution}, {spatial_res}°",
+        "Grid": f"{len(target_lat)} × {len(target_lon)}",
+        "Years": f"{min(YEARS)}-{max(YEARS)}",
+    })
 
     step1_filter_and_regrid(spatial_res, target_lat, target_lon)
     step2_combine_and_interpolate(ttag, ftag, spatial_res)
-    print(f"\nDone: NDVI_2015-2024_{ftag}.nc")
+    done(NDVI_PATH / f"NDVI_{YEARS_TAG}_{ftag}.nc")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess MODIS NDVI data.")
     parser.add_argument("-r", "--resolution", choices=list(RESOLUTION_CONFIG.keys()),
-                        default="1D", help="Temporal resolution (default: 1D)")
-    parser.add_argument("-s", "--spatial", type=float, choices=[0.25, 0.75],
-                        default=0.25, help="Spatial resolution in degrees (default: 0.25)")
+                        default=RESOLUTION, help=f"Temporal resolution (default: {RESOLUTION})")
+    parser.add_argument("-s", "--spatial", type=float, choices=SUPPORTED_SPATIAL_RES,
+                        default=SPATIAL_RES, help=f"Spatial resolution in degrees (default: {SPATIAL_RES})")
     args = parser.parse_args()
     run_ndvi_preprocessing(args.resolution, args.spatial)

@@ -15,9 +15,9 @@ All defaults from config.py, reads model directory from train_final_rf.py.
 
 Usage:
   python compute_permutation_importance.py \
-      --model_dir models/final_rf_v1_20260413_120000
+      --model_dir models/final_rf_<timestamp>
   python compute_permutation_importance.py \
-      --model_dir models/final_rf_v1_20260413_120000 \
+      --model_dir models/final_rf_<timestamp> \
       --n_samples 100000 --n_repeats 10
   python compute_permutation_importance.py \
       --model_dir models/... --no_pdp    # skip PDPs to save a few minutes
@@ -43,18 +43,21 @@ from sklearn.inspection import permutation_importance, PartialDependenceDisplay
 from sklearn.metrics import f1_score
 from scipy.stats import spearmanr
 
-from config import (
-    RESOLUTION, SPATIAL_RES, VAL_YEARS, TEST_YEARS, SDS_PATH,
-    PERM_N_SAMPLES, PERM_N_REPEATS, PERM_SEED
+from sds.config import (
+    PDP_TOP_N, PDP_ICE_SUBSAMPLE, RESOLUTION, SPATIAL_RES,
+    VAL_YEARS, TEST_YEARS, PERM_N_SAMPLES, PERM_N_REPEATS,
+    PERM_SEED,
 )
+from sds.paths import project_relative, model_figures_dir, resolve_path, SDS_PATH
+from sds.log_utils import header, section, done
 
-from data_utils import (
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     collect_indices, extract_from_cache, platt_apply,
 )
-from feature_names import get_feature_name_map
+from sds.feature_names import get_feature_name_map
 
-# plot style parameters
+# plot style
 TITLE_SIZE = 14
 SUBTITLE_SIZE = 12
 LABEL_SIZE = 11
@@ -62,10 +65,6 @@ TICK_SIZE = 9
 LEGEND_SIZE = 9
 SUBPLOT_TITLE_SIZE = 11
 
-# PDP uses all of X for the averaged PD curve but subsamples for the ICE spaghetti lines -
-# 1000 is plenty to show per-sample heterogeneity without the plot turning into fog
-PDP_TOP_N = 6
-PDP_ICE_SUBSAMPLE = 1000
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -81,13 +80,11 @@ plt.rcParams.update({
     "savefig.pad_inches": 0.15,
 })
 
-_YEAR_RANGES: dict = {}  # filled in main with years from config
+_YEAR_RANGES: dict = {}  # filled in main
 
 
 # ---------------------------------------------------------------------------
-# Feature groups + Paired colours
-# (kept in sync with compute_feature_correlations.py on purpose - any update
-#  there should be mirrored here so figures across the paper stay consistent.)
+# Feature groups + Paired colours (same as compute_feature_correlations.py)
 # ---------------------------------------------------------------------------
 FEATURE_GROUPS = [
     ("Temperature", [
@@ -131,10 +128,6 @@ FEATURE_GROUPS = [
     ]),
 ]
 
-# Paired indexing: 0=light blue, 1=dark blue, 2=light green, 3=dark green,
-# 4=light red, 5=dark red, 6=light orange, 7=dark orange. Shades pair
-# semantically-related groups (moisture=blue, vegetation=green, thermal=orange,
-# static=red).
 _PAIRED_COLORS = plt.get_cmap("Paired").colors
 _PAIRED_IDX = {
     "Humidity":      0,   # light blue
@@ -150,11 +143,10 @@ GROUP_BASE_COLOR = {
     name: mcolors.to_hex(_PAIRED_COLORS[_PAIRED_IDX[name]])
     for name, _ in FEATURE_GROUPS
 }
-UNGROUPED_COLOR = "#888888"   # fallback for features not in any group
+UNGROUPED_COLOR = "#888888"  # features not in any group
 
 
 def _group_name_for(feat):
-    # returns the group name for a feature, or None if no group matches
     for name, members in FEATURE_GROUPS:
         if feat in members:
             return name
@@ -162,15 +154,12 @@ def _group_name_for(feat):
 
 
 def _group_color_for(feat):
-    # returns the Paired-based group colour for a feature, or a neutral grey fallback
     g = _group_name_for(feat)
     return GROUP_BASE_COLOR[g] if g is not None else UNGROUPED_COLOR
 
 
 def _group_legend_handles(features_in_plot):
-    # build legend handles only for the groups actually present in the panel,
-    # keeping them in the canonical FEATURE_GROUPS order so legends across
-    # figures sort consistently
+    # legend handles for the groups present, in FEATURE_GROUPS order
     groups_present = {g for g in (_group_name_for(f) for f in features_in_plot)
                       if g is not None}
     handles = [plt.Rectangle((0, 0), 1, 1,
@@ -178,7 +167,6 @@ def _group_legend_handles(features_in_plot):
                              edgecolor="none")
                for name, _ in FEATURE_GROUPS if name in groups_present]
     labels = [name for name, _ in FEATURE_GROUPS if name in groups_present]
-    # if any features fall outside the defined groups, add a single "Other" entry
     if any(_group_name_for(f) is None for f in features_in_plot):
         handles.append(plt.Rectangle((0, 0), 1, 1,
                                      facecolor=UNGROUPED_COLOR, edgecolor="none"))
@@ -187,7 +175,7 @@ def _group_legend_handles(features_in_plot):
 
 
 def _tag_label(tag):
-    # same style as analyze_rf_results.py - labels like "Test (2024)" or "Validation (2022-2023)"
+    # e.g. "Test (2024)"
     yr = _YEAR_RANGES.get(tag)
     if yr is None:
         return tag
@@ -196,24 +184,18 @@ def _tag_label(tag):
 
 
 def _clean_name(name):
-    # strip units (anything in square brackets) for cleaner axis labels
+    # strip units (anything in square brackets)
     return re.sub(r"\s*\[.*?\]", "", name)
 
 
 def _nice(feat, name_map):
-    # get_feature_name_map can return None for unmapped features, and dict.get's default
-    # only kicks in for missing keys - not for keys that are present with a None value
+    # `or` because the name map can contain None values
     long_name = name_map.get(feat)
     return _clean_name(long_name) if long_name else feat
 
 
 # ---------------------------------------------------------------------------
-# Plot functions
-#
-# Each bar plot has two flavours: a default solid-fill version and a "grouped"
-# version that colours every bar by its feature group (Paired palette, same
-# mapping as compute_feature_correlations.py). The grouped plots are written
-# with a `_grouped` suffix so both can coexist in the output directory.
+# Plot functions (each bar plot also has a group-coloured `_grouped` version)
 # ---------------------------------------------------------------------------
 
 def plot_perm_bar(perm_df, od, split, n_samples, n_repeats, scoring, name_map,
@@ -256,8 +238,7 @@ def plot_perm_bar(perm_df, od, split, n_samples, n_repeats, scoring, name_map,
 
 def plot_importance_comparison(perm_df, has_shap, od, split, name_map,
                                group_colored=False):
-    # side-by-side normalised bars for each method - note each panel is sorted by its own metric,
-    # so a feature's row position changes between panels (ordering is not matched across columns)
+    # side-by-side normalised bars per method; each panel is sorted by its own metric
     n_compare = min(20, len(perm_df))
     compare_feats = perm_df.head(n_compare)["feature"].tolist()
 
@@ -275,8 +256,7 @@ def plot_importance_comparison(perm_df, has_shap, od, split, name_map,
             ("MDI", "gini_importance", "#fdbf6f"),
         ]
 
-    # keep track of every feature that actually appears in any panel so the legend
-    # covers the union (otherwise a group showing up in only one panel would be missed)
+    # legend covers every group that appears in any panel
     all_features_plotted = set()
 
     for ax, (label, col, default_color) in zip(axes, comparisons):
@@ -306,9 +286,7 @@ def plot_importance_comparison(perm_df, has_shap, od, split, name_map,
     plt.tight_layout()
 
     if group_colored:
-        # single-row figure legend below all three panels. Reserve bottom space
-        # first so the legend sits below the xlabels and doesn't overlap anything;
-        # ncol=len(handles) keeps everything on one line.
+        # one-row legend below the panels
         fig.subplots_adjust(bottom=0.18)
         handles, labels = _group_legend_handles(sorted(all_features_plotted))
         fig.legend(handles, labels,
@@ -324,17 +302,15 @@ def plot_importance_comparison(perm_df, has_shap, od, split, name_map,
 
 def plot_rank_scatter(perm_df, has_shap, rho_gini, rho_shap, n_feats,
                       od, split, name_map, group_colored=False):
-    # rank scatter - points on the diagonal mean methods agree on ordering,
-    # the 5 biggest disagreements are labelled
+    # rank scatter: diagonal = agreement, the 5 largest disagreements are labelled
     fig, axes_scatter = plt.subplots(1, 2 if has_shap else 1,
                                      figsize=(12 if has_shap else 7, 6))
     if not has_shap:
         axes_scatter = [axes_scatter]
 
-    # per-point colours: group palette when group_colored, else the original per-panel accent
     if group_colored:
         point_colors_gini = [_group_color_for(f) for f in perm_df["feature"]]
-        point_colors_shap = point_colors_gini   # same features, same colours across panels
+        point_colors_shap = point_colors_gini
     else:
         point_colors_gini = "#fdbf6f"
         point_colors_shap = "#a6cee3"
@@ -400,12 +376,7 @@ def plot_rank_scatter(perm_df, has_shap, rho_gini, rho_shap, n_feats,
     plt.tight_layout()
 
     if group_colored:
-        # shared legend below both panels - all features appear on every panel here
-        # (this is just a rank comparison across the same N_feats points), so the
-        # legend is the union of groups that show up in perm_df.
-        # Reserve extra bottom space first so the legend sits below the axis labels,
-        # then anchor it in figure-fraction coords outside the adjusted plot area.
-        # Single-row layout: ncol=len(handles) so every group fits on one line.
+        # one-row legend below both panels
         fig.subplots_adjust(bottom=0.22)
         handles, labels = _group_legend_handles(perm_df["feature"].tolist())
         fig.legend(handles, labels,
@@ -422,21 +393,18 @@ def plot_rank_scatter(perm_df, has_shap, rho_gini, rho_shap, n_feats,
 def plot_pdp_top_features(rf, X, perm_df, feature_vars, od, split,
                           name_map, logger):
     # partial-dependence plots for the top features by permutation importance
-    # ICE spaghetti (thin blue lines) + bold PDP average (red), 2x3 grid for the top 6
-    # note: uses uncalibrated rf.predict_proba - Platt calibration is monotonic so it would only
-    # rescale the y-axis, not change the shape of the curves
+    # ICE lines + PD average, 2x3 grid for the top 6. Uses the uncalibrated
+    # probabilities: Platt scaling is monotonic, so only the y-axis would change.
     top_feats = perm_df.head(PDP_TOP_N)["feature"].tolist()
     top_idx = [feature_vars.index(f) for f in top_feats]
-    logger.info(f"  Computing PDPs for top {len(top_feats)} features ...")
 
     nrow, ncol = 2, 3
     fig, axes = plt.subplots(nrow, ncol, figsize=(4.5 * ncol, 3.8 * nrow))
 
-    # one call per feature so we can place each on its own axis with a clean title -
-    # from_estimator with multiple features lays them out in a single row, which doesn't fit
+    # one call per feature, so each gets its own axis
     for ax, feat, fi in zip(axes.flatten(), top_feats, top_idx):
         display_clean = _nice(feat, name_map)
-        display_full = name_map.get(feat) or feat   # keeps [units] on the x-axis when available
+        display_full = name_map.get(feat) or feat  # keeps the units
         try:
             PartialDependenceDisplay.from_estimator(
                 rf, X, features=[fi],
@@ -454,7 +422,7 @@ def plot_pdp_top_features(rf, X, perm_df, feature_vars, od, split,
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
         except Exception as e:
-            logger.warning(f"    PDP failed for {feat}: {e}")
+            logger.warning(f"  PDP failed for {feat}: {e}")
             ax.set_visible(False)
 
     fig.suptitle(f"Partial Dependence — top {PDP_TOP_N} features — "
@@ -487,21 +455,21 @@ def main():
     parser.add_argument("--val_years", nargs=2, type=int, default=None)
     parser.add_argument("--test_years", nargs=2, type=int, default=None)
     parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--fig_dir", type=str, default=None,
+                        help="figure folder (default: figures/model/<model>/permutation_importance)")
     parser.add_argument("--no_pdp", action="store_true",
                         help="skip PDP plots (they add a few minutes)")
     args = parser.parse_args()
 
-    model_dir = Path(args.model_dir)
+    model_dir = resolve_path(args.model_dir)
     if not model_dir.exists():
-        print(f"ERROR: model_dir not found: {model_dir}")
-        sys.exit(1)
+        sys.exit(f"ERROR: model_dir not found: {model_dir}")
 
     n_samples = args.n_samples or PERM_N_SAMPLES
     n_repeats = args.n_repeats or PERM_N_REPEATS
 
-    # we load the fitted RF directly. With scoring=f1/roc_auc/average_precision, sklearn scores
-    # it via rf.score() - which ignores Platt + the tuned threshold. With scoring=calibrated_f1
-    # we use a custom scorer that routes through the full pipeline (see below).
+    # with scoring=f1/roc_auc/average_precision sklearn scores the raw RF (no Platt,
+    # no tuned threshold); calibrated_f1 uses the full pipeline (see below)
     rf = joblib.load(model_dir / "rf_model.joblib")
 
     results_file = json.loads((model_dir / "results.json").read_text())
@@ -509,32 +477,32 @@ def main():
     data_cfg = results_file["data_config"]
     thr = results_file.get("threshold")
 
-    # load Platt scaler if present - only strictly needed for calibrated_f1 scoring
+    # Platt scaler (needed for calibrated_f1)
     platt_path = model_dir / "platt_scaler.joblib"
     platt_lr = joblib.load(platt_path) if platt_path.exists() else None
     if args.scoring == "calibrated_f1":
         if platt_lr is None or thr is None:
-            print(f"ERROR: calibrated_f1 needs platt_scaler.joblib and threshold in results.json")
-            sys.exit(1)
+            sys.exit("ERROR: calibrated_f1 needs platt_scaler.joblib and a threshold in results.json")
 
-    # CLI overrides → results.json → config defaults
+    # CLI args > results.json > config defaults
     resolution = args.resolution or data_cfg.get("resolution", RESOLUTION)
     spatial_res = args.spatial or data_cfg.get("spatial_res", SPATIAL_RES)
     val_years = args.val_years or data_cfg.get("val_years", VAL_YEARS)
     test_years = args.test_years or data_cfg.get("test_years", TEST_YEARS)
-    sds_path = args.sds_path or data_cfg.get("sds_path") or SDS_PATH
+    sds_path = resolve_path(args.sds_path or data_cfg.get("sds_path") or SDS_PATH)
     split_years = test_years if args.split == "test" else val_years
 
     _YEAR_RANGES["val"]  = tuple(val_years)
     _YEAR_RANGES["test"] = tuple(test_years)
 
-    if sds_path is None:
-        print("ERROR: No SDS path")
-        sys.exit(1)
     sds_file = Path(sds_path)
+    if not sds_file.exists():
+        sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
 
     od = Path(args.out_dir) if args.out_dir else model_dir / "permutation_importance"
     od.mkdir(parents=True, exist_ok=True)
+    fd = Path(args.fig_dir) if args.fig_dir else model_figures_dir(model_dir, "permutation_importance")
+    fd.mkdir(parents=True, exist_ok=True)
 
     name_map = get_feature_name_map(feature_vars)
 
@@ -549,17 +517,13 @@ def main():
     )
     logger = logging.getLogger("perm_imp")
 
-    logger.info("=" * 60)
-    logger.info("PERMUTATION IMPORTANCE")
-    logger.info("=" * 60)
-    logger.info(f"  Model: {model_dir}")
-    logger.info(f"  Split: {args.split} ({split_years})")
-    logger.info(f"  Samples: {n_samples:,}")
-    logger.info(f"  Repeats: {n_repeats}")
-    logger.info(f"  Scoring: {args.scoring}")
-    logger.info(f"  Features: {len(feature_vars)}")
-    logger.info(f"  Output: {od}")
-    logger.info("=" * 60)
+    header("Permutation importance", {
+        "Model": project_relative(model_dir),
+        "Split": f"{args.split} {split_years}",
+        "Samples / repeats": f"{n_samples:,} / {n_repeats}",
+        "Scoring": args.scoring,
+        "Output": f"{project_relative(od)}, {project_relative(fd)}",
+    }, out=logger.info)
 
     cache = FeatureCache(
         resolution=resolution,
@@ -574,15 +538,15 @@ def main():
         ds_sds["latitude"].values, ds_sds["longitude"].values)
 
     years = list(range(split_years[0], split_years[1] + 1))
-    logger.info(f"\nCollecting indices ...")
+    section("Samples", out=logger.info)
     all_pos, all_neg = collect_indices(
-        cache, years, ds_sds, sds_var, land_indices, logger)
+        cache, years, ds_sds, sds_var, land_indices, logger, label=args.split.capitalize())
 
     ds_sds.close()
     del ds_sds
     gc.collect()
 
-    # stratified subsample - keeps the pos/neg ratio of the full split
+    # stratified subsample (keeps the pos/neg ratio of the split)
     rng = np.random.default_rng(PERM_SEED)
     n_total = len(all_pos) + len(all_neg)
     pos_frac = len(all_pos) / n_total
@@ -591,7 +555,7 @@ def main():
     n_pos_sample = min(n_pos_sample, len(all_pos))
     n_neg_sample = min(n_neg_sample, len(all_neg))
 
-    logger.info(f"  Subsampling: {n_pos_sample:,} pos + {n_neg_sample:,} neg")
+    logger.info(f"  Subsample: {n_pos_sample:,} pos, {n_neg_sample:,} neg")
 
     pos_sel = rng.choice(len(all_pos), size=n_pos_sample, replace=False)
     neg_sel = rng.choice(len(all_neg), size=n_neg_sample, replace=False)
@@ -607,20 +571,13 @@ def main():
     del all_pos, all_neg, sample_indices
     gc.collect()
 
-    logger.info(f"  X shape: {X.shape}")
-
-    # actual permutation importance - this is the slow bit, roughly O(n_features * n_repeats)
-    logger.info(f"\nComputing permutation importance "
-                f"({n_repeats} repeats, scoring={args.scoring}) ...")
+    # permutation importance (slow: n_features x n_repeats refits of the scorer)
+    section("Permutation importance", out=logger.info)
     t0 = time.time()
 
-    # build the scoring callable: custom for calibrated_f1, pass-through string for the rest
     if args.scoring == "calibrated_f1":
-        # route every permutation through the deployed pipeline: RF -> Platt -> threshold -> F1.
-        # Threshold is fixed because permutation asks a deployment-time question: "if feature X
-        # got corrupted at inference time, how much F1 would I lose at the threshold I already
-        # chose?" At deployment we don't know in advance which feature will fail, so the
-        # operating point is locked. (Dropout importance is different - see its rationale.)
+        # RF -> Platt -> fixed threshold -> F1: how much F1 is lost if a feature is
+        # corrupted at prediction time, at the threshold already chosen
         def calibrated_f1_scorer(estimator, X_s, y_s):
             proba_raw = estimator.predict_proba(X_s)[:, 1]
             proba_cal = platt_apply(platt_lr, proba_raw)
@@ -639,9 +596,9 @@ def main():
     )
 
     t_perm = time.time() - t0
-    logger.info(f"  Done in {t_perm:.1f}s")
+    logger.info(f"  Computed in {t_perm / 60:.1f} min")
 
-    # assemble results and attach MDI ranks (always available from the fitted RF)
+    # results + MDI ranks
     perm_df = pd.DataFrame({
         "feature": feature_vars,
         "perm_importance_mean": perm_result.importances_mean,
@@ -654,7 +611,7 @@ def main():
     gini_rank_map = {f: r for r, f in enumerate(gini_sorted["feature"], 1)}
     perm_df["gini_rank"] = perm_df["feature"].map(gini_rank_map)
 
-    # pull in SHAP if compute_shap.py has already run
+    # SHAP importance, if compute_shap.py has already run
     shap_file = model_dir / "shap" / "shap_feature_importance.csv"
     if shap_file.exists():
         shap_df = pd.read_csv(shap_file)
@@ -663,59 +620,39 @@ def main():
         perm_df["shap_importance"] = perm_df["feature"].map(shap_map)
         perm_df["shap_rank"] = perm_df["feature"].map(shap_rank_map)
         has_shap = True
-        logger.info(f"  Loaded SHAP importance from {shap_file}")
     else:
         has_shap = False
-        logger.info(f"  SHAP importance not found (run compute_shap.py first)")
+        logger.info("  SHAP importance not found, comparison without SHAP (run compute_shap.py first)")
 
-    # save results
     perm_df.to_csv(od / f"permutation_importance_{args.split}.csv", index=False)
 
-    logger.info(f"\n  Top 20 by permutation importance ({args.scoring}):")
-    logger.info(f"  {'Rank':>4s} {'Feature':<45s} {'Perm':>10s} {'±std':>8s} "
-                f"{'Gini rank':>10s}"
-                + (f" {'SHAP rank':>10s}" if has_shap else ""))
-    logger.info(f"  {'-'*85}")
-    for _, r in perm_df.head(20).iterrows():
-        display = _nice(r["feature"], name_map)
-        line = (f"  {r['perm_rank']:4.0f} {display:<45s} "
-                f"{r['perm_importance_mean']:10.6f} "
-                f"{r['perm_importance_std']:8.6f} "
-                f"{r['gini_rank']:10.0f}")
-        if has_shap:
-            line += f" {r['shap_rank']:10.0f}"
-        logger.info(line)
+    logger.info("  Top 5: " + ", ".join(_nice(f, name_map) for f in perm_df["feature"].head(5)))
 
     # rank correlation across methods
     rho_gini, p_gini = spearmanr(perm_df["perm_rank"], perm_df["gini_rank"])
-    logger.info(f"\n  Rank correlation (Spearman):")
-    logger.info(f"    Permutation vs Gini: ρ={rho_gini:.3f} (p={p_gini:.2e})")
+    logger.info(f"  Rank correlation with MDI: ρ={rho_gini:.3f}")
     rho_shap, p_shap = None, None
     if has_shap:
         rho_shap, p_shap = spearmanr(
             perm_df["perm_rank"].values,
             perm_df["shap_rank"].fillna(len(feature_vars)).values)
-        logger.info(f"    Permutation vs SHAP: ρ={rho_shap:.3f} "
-                    f"(p={p_shap:.2e})")
+        logger.info(f"  Rank correlation with SHAP: ρ={rho_shap:.3f}")
 
     # plots
-    logger.info(f"\nPlotting ...")
+    section("Figures", out=logger.info)
     n_feats = len(feature_vars)
-    # default (uniform-colour) + grouped (Paired-per-group) versions of each bar/scatter plot
     for gc_flag in (False, True):
-        plot_perm_bar(perm_df, od, args.split, n_samples, n_repeats,
+        plot_perm_bar(perm_df, fd, args.split, n_samples, n_repeats,
                       args.scoring, name_map, group_colored=gc_flag)
-        plot_importance_comparison(perm_df, has_shap, od, args.split, name_map,
+        plot_importance_comparison(perm_df, has_shap, fd, args.split, name_map,
                                    group_colored=gc_flag)
         plot_rank_scatter(perm_df, has_shap, rho_gini,
                           rho_shap if rho_shap is not None else 0.0,
-                          n_feats, od, args.split, name_map,
+                          n_feats, fd, args.split, name_map,
                           group_colored=gc_flag)
     if not args.no_pdp:
-        t_pdp = time.time()
-        plot_pdp_top_features(rf, X, perm_df, feature_vars, od, args.split,
+        plot_pdp_top_features(rf, X, perm_df, feature_vars, fd, args.split,
                               name_map, logger)
-        logger.info(f"  PDPs done in {time.time() - t_pdp:.1f}s")
 
     summary = {
         "split": args.split,
@@ -741,15 +678,7 @@ def main():
     with open(od / f"perm_importance_summary_{args.split}.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
-    logger.info(f"\n{'='*60}")
-    logger.info("PERMUTATION IMPORTANCE COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"  Output: {od}")
-    logger.info(f"  Time: {t_perm:.1f}s")
-    logger.info(f"  Perm vs Gini rank correlation: ρ={rho_gini:.3f}")
-    if has_shap:
-        logger.info(f"  Perm vs SHAP rank correlation: ρ={rho_shap:.3f}")
-    logger.info(f"{'='*60}")
+    done(od, out=logger.info)
 
 
 if __name__ == "__main__":

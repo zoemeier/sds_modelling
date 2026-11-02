@@ -12,8 +12,8 @@ Reports both event-level rates and pixel-weighted rates at multiple
 overlap thresholds.
 
 Usage:
-  python event_iou_analysis.py --model_dir models/final_rf_v1_20260413_120000
-  python event_iou_analysis.py --model_dir models/final_rf_v1_20260413_120000 --split val
+  python event_iou_analysis.py --model_dir models/final_rf_<timestamp>
+  python event_iou_analysis.py --model_dir models/final_rf_<timestamp> --split val
 """
 
 import argparse
@@ -32,10 +32,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy import ndimage
 
-from config import (
-    RESOLUTION, SPATIAL_RES, VAL_YEARS, TEST_YEARS, SDS_PATH,
+from sds.config import (
+    EVENT_CONNECTIVITY, EVENT_OVERLAP_THRESHOLDS, EVENT_SIZE_BINS, EVENT_SIZE_OVERLAP_THRESHOLDS,
+    RESOLUTION, SPATIAL_RES, VAL_YEARS, TEST_YEARS,
 )
-from data_utils import (
+from sds.paths import project_relative, model_figures_dir, resolve_path, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     platt_apply, make_target_for_year,
 )
@@ -113,68 +116,9 @@ def compute_rates(events_df, thresholds):
     return pd.DataFrame(results)
 
 
-def compute_event_f1(recall_rates, precision_rates):
-    # harmonic mean of recall and precision at each overlap threshold, both versions
-    merged = recall_rates.merge(precision_rates, on="threshold",
-                                 suffixes=("_recall", "_precision"))
-    r = merged["event_rate_recall"]
-    p = merged["event_rate_precision"]
-    merged["event_f1"] = np.where((p + r) > 0, 2 * p * r / (p + r), 0.0)
-
-    rw = merged["pixel_weighted_rate_recall"]
-    pw = merged["pixel_weighted_rate_precision"]
-    merged["pixel_f1"] = np.where((pw + rw) > 0, 2 * pw * rw / (pw + rw), 0.0)
-
-    return merged
-
-
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def plot_event_f1(f1_df, od, tag):
-    # two plots: one pixel-weighted, one event-level - each shows F1/precision/recall vs overlap thr
-    lw = 2.0
-    ms = 5
-
-    # ── Pixel-weighted plot ───────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(f1_df["threshold"], f1_df["pixel_f1"],
-            "o-", color="#222", lw=lw, ms=ms, label="F1")
-    ax.plot(f1_df["threshold"], f1_df["pixel_weighted_rate_recall"],
-            "^-", color="#70AD47", lw=lw, ms=ms, label="Recall")
-    ax.plot(f1_df["threshold"], f1_df["pixel_weighted_rate_precision"],
-            "s-", color="#4472C4", lw=lw, ms=ms, label="Precision")
-    ax.set_xlabel("Overlap Threshold", fontsize=12)
-    ax.set_ylabel("Score", fontsize=12)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.2)
-    ax.set_title(f"Pixel-Weighted Event Metrics vs Overlap Threshold — {tag}",
-                 fontsize=14, fontweight="bold")
-    fig.savefig(od / f"event_iou_f1_pixel_{tag}.png")
-    plt.close(fig)
-
-    # ── Event-level plot ──────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(f1_df["threshold"], f1_df["event_f1"],
-            "o-", color="#222", lw=lw, ms=ms, label="F1")
-    ax.plot(f1_df["threshold"], f1_df["event_rate_recall"],
-            "^-", color="#70AD47", lw=lw, ms=ms, label="Recall")
-    ax.plot(f1_df["threshold"], f1_df["event_rate_precision"],
-            "s-", color="#4472C4", lw=lw, ms=ms, label="Precision")
-    ax.set_xlabel("Overlap Threshold", fontsize=12)
-    ax.set_ylabel("Score", fontsize=12)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=10)
-    ax.grid(alpha=0.2)
-    ax.set_title(f"Event-Level Metrics vs Overlap Threshold — {tag}",
-                 fontsize=14, fontweight="bold")
-    fig.savefig(od / f"event_iou_f1_event_{tag}.png")
-    plt.close(fig)
-
-
 def plot_rates(recall_rates, precision_rates, od, tag):
     # two-panel: recall on the left, precision on the right, each showing both weighting schemes
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5.5))
@@ -278,8 +222,8 @@ def plot_overlap_histograms(recall_df, precision_df, od, tag):
 
 def plot_by_event_size(recall_df, precision_df, od, tag):
     # breaks recall/precision rates down by event size so we can see whether small events are the ones being missed
-    size_bins = [1, 2, 5, 10, 20, 50, 100, 500, np.inf]
-    overlap_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    size_bins = EVENT_SIZE_BINS
+    overlap_thresholds = EVENT_SIZE_OVERLAP_THRESHOLDS
 
     for overlap_thr in overlap_thresholds:
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5.5))
@@ -338,12 +282,13 @@ def main():
     parser.add_argument("--val_years", nargs=2, type=int, default=None)
     parser.add_argument("--test_years", nargs=2, type=int, default=None)
     parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--fig_dir", type=str, default=None,
+                        help="figure folder (default: figures/model/<model>/event_analysis)")
     args = parser.parse_args()
 
-    model_dir = Path(args.model_dir)
+    model_dir = resolve_path(args.model_dir)
     if not model_dir.exists():
-        print(f"ERROR: model_dir not found: {model_dir}")
-        sys.exit(1)
+        sys.exit(f"ERROR: model_dir not found: {model_dir}")
 
     # load model
     rf = joblib.load(model_dir / "rf_model.joblib")
@@ -359,16 +304,17 @@ def main():
     spatial_res = args.spatial or data_cfg.get("spatial_res", SPATIAL_RES)
     val_years = args.val_years or data_cfg.get("val_years", VAL_YEARS)
     test_years = args.test_years or data_cfg.get("test_years", TEST_YEARS)
-    sds_path = args.sds_path or data_cfg.get("sds_path") or SDS_PATH
+    sds_path = resolve_path(args.sds_path or data_cfg.get("sds_path") or SDS_PATH)
     split_years = test_years if args.split == "test" else val_years
 
-    if sds_path is None:
-        print("ERROR: No SDS path")
-        sys.exit(1)
     sds_file = Path(sds_path)
+    if not sds_file.exists():
+        sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
 
     od = Path(args.out_dir) if args.out_dir else model_dir / "event_analysis"
     od.mkdir(parents=True, exist_ok=True)
+    fd = Path(args.fig_dir) if args.fig_dir else model_figures_dir(model_dir, "event_analysis")
+    fd.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -381,14 +327,12 @@ def main():
     )
     logger = logging.getLogger("event_iou")
 
-    logger.info("=" * 60)
-    logger.info("EVENT-LEVEL OVERLAP ANALYSIS")
-    logger.info("=" * 60)
-    logger.info(f"  Model: {model_dir}")
-    logger.info(f"  Split: {args.split} ({split_years})")
-    logger.info(f"  Threshold: {thr:.4f}")
-    logger.info(f"  Output: {od}")
-    logger.info("=" * 60)
+    header("Event-level overlap analysis", {
+        "Model": project_relative(model_dir),
+        "Split": f"{args.split} {split_years}",
+        "Threshold": f"{thr:.4f}",
+        "Output": f"{project_relative(od)}, {project_relative(fd)}",
+    }, out=logger.info)
 
     # load data
     cache = FeatureCache(
@@ -410,10 +354,10 @@ def main():
     nlat, nlon = len(unique_lats), len(unique_lons)
     n_land = len(land_indices)
 
-    logger.info(f"  Grid: {nlat} × {nlon}, land cells: {n_land:,}")
-    logger.info(f"\nProcessing days ...")
+    section("Events per day", out=logger.info)
 
-    struct = np.ones((3, 3))   # 8-connectivity for connected components
+    # connected-component structure: 8 = diagonal neighbours join an event, 4 = only edges
+    struct = np.ones((3, 3)) if EVENT_CONNECTIVITY == 8 else ndimage.generate_binary_structure(2, 1)
     all_recall_events = []
     all_precision_events = []
 
@@ -487,97 +431,42 @@ def main():
             all_precision_events.extend(precision_ev)
             n_days_processed += 1
 
-        logger.info(f"  {year}: {n_times} days processed "
-                    f"({len(all_recall_events):,} truth events, "
-                    f"{len(all_precision_events):,} pred events so far)")
+        logger.info(f"  {year}: {n_times} days")
 
         del y_year, proba_year
         gc.collect()
 
     ds_sds.close()
     t_total = time.time() - t0
-    logger.info(f"\n  Total: {n_days_processed} days in {t_total:.1f}s")
-
     recall_df = pd.DataFrame(all_recall_events)
     precision_df = pd.DataFrame(all_precision_events)
 
-    logger.info(f"  Ground-truth events: {len(recall_df):,}")
-    logger.info(f"  Predicted events: {len(precision_df):,}")
+    logger.info(f"  Events: {len(recall_df):,} true, {len(precision_df):,} predicted "
+                f"({t_total / 60:.1f} min)")
 
     if len(recall_df) == 0 or len(precision_df) == 0:
-        logger.warning("  No events found — skipping analysis")
+        logger.warning("  No events found, analysis skipped")
         return
 
     # compute rates at multiple overlap thresholds
-    thresholds = [0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    thresholds = EVENT_OVERLAP_THRESHOLDS
 
     recall_rates = compute_rates(recall_df, thresholds)
     precision_rates = compute_rates(precision_df, thresholds)
 
-    logger.info(f"\n  Recall direction (ground-truth events found):")
-    logger.info(f"  {'Overlap':>10s} {'Event rate':>12s} {'Pixel-weighted':>16s} "
-                f"{'Found':>8s} {'Total':>8s}")
-    logger.info(f"  {'-'*58}")
-    for _, r in recall_rates.iterrows():
-        logger.info(f"  {r['threshold']:>10.2f} {r['event_rate']:>12.1%} "
-                    f"{r['pixel_weighted_rate']:>16.1%} "
-                    f"{r['n_found']:>8,} {r['n_total']:>8,}")
-
-    logger.info(f"\n  Precision direction (predicted events that are real):")
-    logger.info(f"  {'Overlap':>10s} {'Event rate':>12s} {'Pixel-weighted':>16s} "
-                f"{'Found':>8s} {'Total':>8s}")
-    logger.info(f"  {'-'*58}")
-    for _, r in precision_rates.iterrows():
-        logger.info(f"  {r['threshold']:>10.2f} {r['event_rate']:>12.1%} "
-                    f"{r['pixel_weighted_rate']:>16.1%} "
-                    f"{r['n_found']:>8,} {r['n_total']:>8,}")
-
-    logger.info(f"\n  Recall event overlap: "
-                f"mean={recall_df['overlap_frac'].mean():.3f}, "
-                f"median={recall_df['overlap_frac'].median():.3f}")
-    logger.info(f"  Precision event overlap: "
-                f"mean={precision_df['overlap_frac'].mean():.3f}, "
-                f"median={precision_df['overlap_frac'].median():.3f}")
-    logger.info(f"  Recall event sizes: "
-                f"mean={recall_df['size'].mean():.1f}, "
-                f"median={recall_df['size'].median():.0f}")
-    logger.info(f"  Precision event sizes: "
-                f"mean={precision_df['size'].mean():.1f}, "
-                f"median={precision_df['size'].median():.0f}")
-
     # plots
-    logger.info(f"\nPlotting ...")
     tag = args.split
 
-    plot_rates(recall_rates, precision_rates, od, tag)
-    plot_rates_pixel_only(recall_rates, precision_rates, od, tag)
-    plot_overlap_histograms(recall_df, precision_df, od, tag)
-    plot_by_event_size(recall_df, precision_df, od, tag)
-
-    f1_df = compute_event_f1(recall_rates, precision_rates)
-    plot_event_f1(f1_df, od, tag)
-
-    logger.info(f"\n  Event-level F1 (pixel-weighted):")
-    logger.info(f"  {'Overlap':>10s} {'Recall':>10s} {'Precision':>10s} {'F1':>10s}")
-    logger.info(f"  {'-'*44}")
-    for _, r in f1_df.iterrows():
-        logger.info(f"  {r['threshold']:>10.2f} "
-                    f"{r['pixel_weighted_rate_recall']:>10.3f} "
-                    f"{r['pixel_weighted_rate_precision']:>10.3f} "
-                    f"{r['pixel_f1']:>10.3f}")
-
-    best_idx = f1_df["pixel_f1"].idxmax()
-    best_thr = f1_df.loc[best_idx, "threshold"]
-    best_f1 = f1_df.loc[best_idx, "pixel_f1"]
-    logger.info(f"\n  Best pixel-weighted F1: {best_f1:.3f} "
-                f"(at overlap ≥ {best_thr:.2f})")
+    plot_rates(recall_rates, precision_rates, fd, tag)
+    plot_rates_pixel_only(recall_rates, precision_rates, fd, tag)
+    plot_overlap_histograms(recall_df, precision_df, fd, tag)
+    plot_by_event_size(recall_df, precision_df, fd, tag)
 
     # save raw data alongside the plots
     recall_df.to_csv(od / f"recall_events_{tag}.csv", index=False)
     precision_df.to_csv(od / f"precision_events_{tag}.csv", index=False)
     recall_rates.to_csv(od / f"recall_rates_{tag}.csv", index=False)
     precision_rates.to_csv(od / f"precision_rates_{tag}.csv", index=False)
-    f1_df.to_csv(od / f"event_f1_{tag}.csv", index=False)
 
     summary = {
         "split": tag,
@@ -589,44 +478,21 @@ def main():
         "recall_overlap_median": float(recall_df["overlap_frac"].median()),
         "precision_overlap_mean": float(precision_df["overlap_frac"].mean()),
         "precision_overlap_median": float(precision_df["overlap_frac"].median()),
-        "recall_at_0.1": float(recall_rates.loc[
-            recall_rates["threshold"] == 0.1, "event_rate"].iloc[0]),
-        "recall_at_0.3": float(recall_rates.loc[
-            recall_rates["threshold"] == 0.3, "event_rate"].iloc[0]),
-        "recall_at_0.5": float(recall_rates.loc[
-            recall_rates["threshold"] == 0.5, "event_rate"].iloc[0]),
-        "precision_at_0.1": float(precision_rates.loc[
-            precision_rates["threshold"] == 0.1, "event_rate"].iloc[0]),
-        "precision_at_0.3": float(precision_rates.loc[
-            precision_rates["threshold"] == 0.3, "event_rate"].iloc[0]),
-        "precision_at_0.5": float(precision_rates.loc[
-            precision_rates["threshold"] == 0.5, "event_rate"].iloc[0]),
-        "best_pixel_f1": float(best_f1),
-        "best_pixel_f1_threshold": float(best_thr),
+        # event rate per overlap threshold (config.EVENT_OVERLAP_THRESHOLDS)
+        "recall": {f"{t:g}": float(r) for t, r in
+                   zip(recall_rates["threshold"], recall_rates["event_rate"])},
+        "precision": {f"{t:g}": float(r) for t, r in
+                      zip(precision_rates["threshold"], precision_rates["event_rate"])},
     }
     with open(od / f"event_iou_summary_{tag}.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    logger.info(f"\n{'='*60}")
-    logger.info("EVENT OVERLAP ANALYSIS COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"  Output: {od}")
-    logger.info(f"  Key results:")
-    logger.info(f"    Recall  @10% overlap: "
-                f"{summary['recall_at_0.1']:.1%} of storms found")
-    logger.info(f"    Recall  @30% overlap: "
-                f"{summary['recall_at_0.3']:.1%} of storms found")
-    logger.info(f"    Recall  @50% overlap: "
-                f"{summary['recall_at_0.5']:.1%} of storms found")
-    logger.info(f"    Precision @10% overlap: "
-                f"{summary['precision_at_0.1']:.1%} of predictions real")
-    logger.info(f"    Precision @30% overlap: "
-                f"{summary['precision_at_0.3']:.1%} of predictions real")
-    logger.info(f"    Precision @50% overlap: "
-                f"{summary['precision_at_0.5']:.1%} of predictions real")
-    logger.info(f"    Best pixel-weighted F1: {best_f1:.3f} "
-                f"(overlap ≥ {best_thr:.2f})")
-    logger.info(f"{'='*60}")
+    section("Results", out=logger.info)
+    shown = [k for k in ("0.1", "0.3", "0.5") if k in summary["recall"]] or list(summary["recall"])
+    for k in shown:
+        logger.info(f"  {float(k):.0%} overlap: {summary['recall'][k]:.1%} of true events found, "
+                    f"{summary['precision'][k]:.1%} of predicted events real")
+    done(od, out=logger.info)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """
-SDS intermediate source detection — Step 2 of the backtracing pipeline.
+SDS backtracking, step 2: intermediate source detection.
 
 Reads Step 1 output (plume tracks + segmentation) and flags intermediate
 dust emission sources along each plume track.
@@ -22,12 +22,11 @@ aggregation, so they are the true maximum / mean over each timestep.
 All arguments accept multiple values; the script runs every combination.
 
 Usage:
-  python backtrace_intermediate_regions.py
-  python backtrace_intermediate_regions.py --ws_max_thr 7.0 8.0 --dry_run
-  python backtrace_intermediate_regions.py --delta_ae 0.01 0.02 0.03
+  python detect_intermediate_sources.py
+  python detect_intermediate_sources.py --ws_max_thr 7.0 8.0 --dry_run
+  python detect_intermediate_sources.py --delta_ae 0.01 0.02 0.03
 """
 
-from pathlib import Path
 from collections import defaultdict
 import argparse
 import sys
@@ -44,97 +43,15 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 
-# =============================================================================
-# PROJECT PATHS
-# =============================================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH    = PROJECT_ROOT / "data"
-INTERIM_PATH = DATA_PATH / "interim"
-ERA5_PATH    = DATA_PATH / "era5"
-NDVI_PATH    = DATA_PATH / "ndvi"
-
-
-def _experiment_summary_path():
-    return (DATA_PATH / "backtrace_overlap_output" / "combination_overlap"
-            / "intermediate_experiment_summary.csv")
-
-
-RESOLUTION_MAP = {
-    ("daily", 0.25): ("BACKTRACING_INPUT_2015-2024_daily_025.nc",    24),
-    ("6h",    0.25): ("BACKTRACING_INPUT_2015-2024_6hourly_025.nc",   6),
-    ("3h",    0.25): ("BACKTRACING_INPUT_2015-2024_3hourly_025.nc",   3),
-    ("daily", 0.75): ("BACKTRACING_INPUT_2015-2024_daily_075.nc",    24),
-    ("6h",    0.75): ("BACKTRACING_INPUT_2015-2024_6hourly_075.nc",   6),
-    ("3h",    0.75): ("BACKTRACING_INPUT_2015-2024_3hourly_075.nc",   3),
-}
-
-TEMPORAL_TAG = {"daily": "daily", "6h": "6hourly", "3h": "3hourly"}
-
-
-def _spatial_tag(grid_res):
-    return f"{grid_res:.2f}".replace(".", "")
-
-
-LAND_MASK_FILE = ERA5_PATH / "ERA5_land_sea_mask_2020.grib"
-LSM_THRESHOLD  = 0.2
-
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-
-class TeeLogger:
-    def __init__(self, logpath: Path):
-        self.terminal = sys.stdout
-        self.logfile  = open(logpath, "w", buffering=1)
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.logfile.write(message)
-
-    def flush(self):
-        self.terminal.flush()
-        self.logfile.flush()
-
-    def close(self):
-        self.logfile.close()
-
-
-# =============================================================================
-# FOLDER NAME HELPERS
-# =============================================================================
-
-def _dotfree(val):
-    s = f"{val:.10f}".rstrip("0").rstrip(".")
-    return s.replace(".", "")
-
-
-def make_step1_folder_name(angstr, duaod, pm10, min_pixels, iou,
-                           max_gap, stubs, memory):
-    """Reproduce Step 1's folder naming"""
-    ae_str    = _dotfree(angstr)
-    duaod_str = _dotfree(duaod)
-    exp = int(np.floor(np.log10(abs(pm10))))
-    coeff = pm10 / (10 ** exp)
-    while coeff != int(coeff) and abs(coeff) < 1e6:
-        coeff *= 10
-        exp -= 1
-    pm10_str = f"{int(coeff)}en{exp}"
-    iou_str = _dotfree(iou)
-    return (f"{ae_str}ae_{duaod_str}duaod_{pm10_str}pm10"
-            f"_{min_pixels}px_{iou_str}iou_{max_gap}gap_{stubs}stub_{memory}mem")
-
-
-def make_step2_folder_name(ws_mean_thr, ws_max_thr, ws_mean_base, ws_max_base,
-                            ndvi_thr, snow_thr,
-                            delta_ae, min_cluster, upwind_plume_k, ref_stat):
-    """Encode Step 2 parameters in a dot-free folder name."""
-    wind_tag = (f"ndvidep_{_dotfree(ws_mean_base)}to{_dotfree(ws_mean_thr)}wsmean"
-                f"_{_dotfree(ws_max_base)}to{_dotfree(ws_max_thr)}wsmax")
-    det_tag = f"upwindplume_k{upwind_plume_k}_{ref_stat}_{_dotfree(delta_ae)}dae"
-    return (f"{wind_tag}_{_dotfree(ndvi_thr)}ndvi_{_dotfree(snow_thr)}snow"
-            f"_{det_tag}_{min_cluster}clust")
+from sds.config import (
+    NDVI_PATH, LAND_MASK_FILE, LSM_THRESHOLD, RESOLUTION,
+    SPATIAL_RES, STEP1_PARAMS as S1, STEP2_PARAMS as S2,
+)
+from sds.paths import (
+    STEP2_SUMMARY_CSV, backtracking_input, grid_dir, step1_folder_name,
+    step2_folder_name, file_tag, project_relative, YEARS_TAG,
+)
+from sds.log_utils import TeeLogger, header, section, done
 
 
 # =============================================================================
@@ -188,11 +105,9 @@ def _load_ndvi_fast(ti, ndvi_data, snow_data, ndvi_ti_map, ndvi_yi, ndvi_xi):
 
 def load_land_mask(target_lat, target_lon):
     lsm_ds = xr.open_dataset(LAND_MASK_FILE, engine="cfgrib").squeeze()
-    lsm_var = next((v for v in ("lsm", "land_sea_mask", "LSM") if v in lsm_ds),
-                   list(lsm_ds.data_vars)[0])
     lsm_lat  = lsm_ds["latitude"].values
     lsm_lon  = lsm_ds["longitude"].values
-    lsm_vals = lsm_ds[lsm_var].values.astype("float32")
+    lsm_vals = lsm_ds["lsm"].values.astype("float32")
     lsm_ds.close()
     if target_lon.min() < 0 and lsm_lon.max() > 180:
         lsm_lon  = np.where(lsm_lon > 180, lsm_lon - 360, lsm_lon)
@@ -281,7 +196,7 @@ def detect_intermediates_upwind_plume(
     plume_t, plume_t1_mask, duaod_t, ae_t, ae_t1,
     u10_t, v10_t, dt_hours, grid_res, lat_arr, lon_arr,
     delta_ae_thr,
-    k_neighbours=4, ref_stat="median",
+    k_neighbours, ref_stat,
     plume_ref_ae=None,
 ):
     """
@@ -325,7 +240,6 @@ def detect_intermediates_upwind_plume(
     ])
     tree_t1 = cKDTree(tree_coords)
 
-    duaod_t1_plume = None  
     ae_t1_plume    = ae_t1[ys_t1, xs_t1]
 
     ys, xs = np.where(plume_t)
@@ -477,38 +391,34 @@ def apply_emission_filter(candidate_mask, ws_max_t, ws_mean_t,
 
 def run_intermediate_detection(
     # Step 1 params (locate output folder)
-    resolution="daily", grid_res=0.25,
-    s1_angstr=0.8, s1_duaod=0.2, s1_pm10=1.5e-7,
-    s1_min_pixels=4, s1_iou=0.1, s1_max_gap=1, s1_stubs=1, s1_memory=0,
+    resolution=RESOLUTION, grid_res=SPATIAL_RES,
+    s1_angstr=S1["angstr"], s1_duaod=S1["duaod"], s1_pm10=S1["pm10"],
+    s1_min_pixels=S1["min_pixels"], s1_iou=S1["iou"], s1_max_gap=S1["max_gap"],
+    s1_stubs=S1["stubs"], s1_memory=S1["memory"],
     # Step 2 params
-    ws_mean_thr=6.0, ws_max_thr=8.0,
-    ws_mean_base=3.5, ws_max_base=5.0,
-    ndvi_thr=0.15, snow_thr=0.25,
-    delta_ae=0.02,
-    min_cluster=4,
-    upwind_plume_k=4,
-    ref_stat="median",
+    ws_mean_thr=S2["ws_mean_thr"], ws_max_thr=S2["ws_max_thr"],
+    ws_mean_base=S2["ws_mean_base"], ws_max_base=S2["ws_max_base"],
+    ndvi_thr=S2["ndvi_thr"], snow_thr=S2["snow_thr"],
+    delta_ae=S2["delta_ae"],
+    min_cluster=S2["min_cluster"],
+    upwind_plume_k=S2["upwind_plume_k"],
+    ref_stat=S2["ref_stat"],
 ):
     wall_start = _time.time()
 
-    res_key = (resolution, grid_res)
-    if res_key not in RESOLUTION_MAP:
-        raise ValueError(f"Unknown resolution combo {res_key}")
-    in_filename, dt_hours = RESOLUTION_MAP[res_key]
+    input_file, dt_hours = backtracking_input(resolution, grid_res)
 
-    grid_res_str = f"{grid_res:.2f}".replace(".", "")
-    s1_folder = make_step1_folder_name(
+    s1_folder = step1_folder_name(
         s1_angstr, s1_duaod, s1_pm10, s1_min_pixels,
         s1_iou, s1_max_gap, s1_stubs, s1_memory,
     )
-    s1_dir = (DATA_PATH / "backtrace_overlap_output" / "combination_overlap"
-              / f"{resolution}_{grid_res_str}" / s1_folder)
+    s1_dir = grid_dir(resolution, grid_res) / s1_folder
 
     if not s1_dir.exists():
-        print(f"  ERROR: Step 1 output not found: {s1_dir}")
-        return None
+        raise FileNotFoundError(
+            f"Step 1 output not found: {s1_dir}. Run build_trajectories.py first.")
 
-    s2_folder = make_step2_folder_name(
+    s2_folder = step2_folder_name(
         ws_mean_thr, ws_max_thr, ws_mean_base, ws_max_base,
         ndvi_thr, snow_thr,
         delta_ae, min_cluster, upwind_plume_k, ref_stat,
@@ -518,38 +428,23 @@ def run_intermediate_detection(
 
     done_marker = out_dir / "_RUN_COMPLETE"
     if done_marker.exists():
-        print(f"  SKIPPING (already completed): {out_dir}")
+        print(f"  Already exists: {project_relative(out_dir)}")
         return None
 
     logger = TeeLogger(out_dir / "run_log.txt")
     sys.stdout = logger
 
-    print("=" * 72)
-    print("SDS Intermediate Source Detection (upwind-plume, AE-only)")
-    print("=" * 72)
-    print(f"  Resolution     : {resolution} (dt = {dt_hours}h)")
-    print(f"  Grid res       : {grid_res}°")
-    print(f"  Step 1 dir     : {s1_dir}")
-    print(f"  Step 2 dir     : {out_dir}")
-    print(f"  WS_MEAN_THR    : {ws_mean_thr}  (at NDVI={ndvi_thr})")
-    print(f"  WS_MAX_THR     : {ws_max_thr}  (at NDVI={ndvi_thr})")
-    print(f"  WS_MEAN_BASE   : {ws_mean_base}  (at NDVI=0)")
-    print(f"  WS_MAX_BASE    : {ws_max_base}  (at NDVI=0)")
-    print(f"    Ramp: ws_mean_thr(ndvi) = {ws_mean_base} + "
-          f"{(ws_mean_thr - ws_mean_base)/ndvi_thr:.1f} × ndvi  (up to NDVI={ndvi_thr})")
-    print(f"    Ramp: ws_max_thr(ndvi)  = {ws_max_base} + "
-          f"{(ws_max_thr - ws_max_base)/ndvi_thr:.1f} × ndvi  (up to NDVI={ndvi_thr})")
-    print(f"  NDVI_THR       : {ndvi_thr}")
-    print(f"  SNOW_THR       : {snow_thr}")
-    print(f"  DELTA_AE       : {delta_ae}")
-    print(f"  MIN_CLUSTER    : {min_cluster}")
-    print(f"  REF_STAT       : {ref_stat}")
-    print(f"  UPWIND_PLUME_K : {upwind_plume_k}  (K nearest predecessor-plume pixels)")
-    print()
+    header("Backtracking step 2: intermediate source detection", {
+        "Resolution": f"{resolution}, {grid_res}°",
+        "Step 1 run": project_relative(s1_dir),
+        "Output": project_relative(out_dir),
+        "ws_mean thr (NDVI 0 → ndvi_thr)": f"{ws_mean_base} → {ws_mean_thr} m/s",
+        "ws_max thr (NDVI 0 → ndvi_thr)": f"{ws_max_base} → {ws_max_thr} m/s",
+        "ndvi / snow / delta_ae": f"{ndvi_thr} / {snow_thr} / {delta_ae}",
+        "min_cluster / upwind_k / ref_stat": f"{min_cluster} / {upwind_plume_k} / {ref_stat}",
+    })
 
     # ---- Load data ----
-    print("Loading data ...")
-    input_file = INTERIM_PATH / in_filename
     ds = xr.open_dataset(input_file)
     if _time_dim(ds) != "time":
         ds = ds.rename({_time_dim(ds): "time"})
@@ -582,34 +477,27 @@ def run_intermediate_detection(
     sm_times = src_masks_xr["source_time"].values
 
     # NDVI
-    ttag = TEMPORAL_TAG[resolution]
-    stag = _spatial_tag(grid_res)
-    ndvi_file = NDVI_PATH / f"NDVI_2015-2024_{ttag}_{stag}.nc"
+    ndvi_file = NDVI_PATH / f"NDVI_{YEARS_TAG}_{file_tag(resolution, grid_res)}.nc"
     use_ndvi  = ndvi_file.exists()
     ndvi_data = ndvi_ti_map = ndvi_yi = ndvi_xi = snow_data = None
     ndvi_ds = None
     if use_ndvi:
         ndvi_ds = xr.open_dataset(ndvi_file)
-        if hasattr(ndvi_ds.time.values[0], "datetime"):
-            ndvi_ds["time"] = pd.to_datetime([
-                str(t)[:19] for t in ndvi_ds.time.values
-            ])
         ndvi_data  = ndvi_ds["NDVI_mean"].values.astype("float32")
         snow_data  = ndvi_ds["snow_frac"].values.astype("float32")
         ndvi_times = ndvi_ds.time.values.astype("datetime64[ns]")
-        lat_name = "lat" if "lat" in ndvi_ds.dims else "latitude"
-        lon_name = "lon" if "lon" in ndvi_ds.dims else "longitude"
-        ndvi_lat = ndvi_ds[lat_name].values
-        ndvi_lon = ndvi_ds[lon_name].values
+        ndvi_lat = ndvi_ds["latitude"].values
+        ndvi_lon = ndvi_ds["longitude"].values
         ndvi_ds.close()
-    print(f"  NDVI: {ndvi_file.name} ({'found' if use_ndvi else 'NOT FOUND'})")
+    if not use_ndvi:
+        print(f"  WARNING: {ndvi_file.name} not found, NDVI and snow filters disabled")
 
     has_ws_max  = "ws_max"  in ds.data_vars
     has_ws_mean = "ws_mean" in ds.data_vars
     if not has_ws_max:
-        print(f"  WARNING: ws_max not found in input — will compute from u10/v10 (instantaneous, less accurate)")
+        print("  WARNING: ws_max not in input, using instantaneous wind speed from u10/v10")
     if not has_ws_mean:
-        print(f"  WARNING: ws_mean not found in input — will compute from u10/v10 (instantaneous)")
+        print("  WARNING: ws_mean not in input, using instantaneous wind speed from u10/v10")
 
     LAT   = ds["latitude"].values
     LON   = ds["longitude"].values
@@ -635,11 +523,6 @@ def run_intermediate_detection(
             ndvi_yi = ndvi_xi = None
 
     land_mask = load_land_mask(LAT, LON)
-    print(f"  Grid: {len(LAT)}x{len(LON)}, {NT} timesteps, "
-          f"{tracks['cell'].nunique()} tracks")
-    print(f"  Land cells: {land_mask.sum():,}/{land_mask.size:,}")
-
-    print("  Indexing genesis birth masks ...")
     genesis_birth = {}
     for ci, cid in enumerate(sm_cids):
         cid = int(cid)
@@ -647,7 +530,6 @@ def run_intermediate_detection(
         ti  = int(np.argmin(np.abs(TIMES - t0)))
         genesis_birth[cid] = (ti, src_masks_xr["source_mask"][ci].values.astype(bool))
     src_masks_xr.close()
-    print(f"    {len(genesis_birth)} genesis regions")
 
     def _load_wind_fields(ti):
         if has_ws_max:
@@ -702,7 +584,7 @@ def run_intermediate_detection(
         v_ft[_ti] = z
 
     # ---- Paint genesis pixels ----
-    print("\nPainting genesis pixels ...")
+    section("Genesis sources")
     ti_to_genesis = defaultdict(list)
     for cid, (ti, bmask) in genesis_birth.items():
         ti_to_genesis[ti].append((cid, bmask))
@@ -771,7 +653,7 @@ def run_intermediate_detection(
     seg_times    = pd.to_datetime(seg_ds["time"].values)
     cell_times   = tracks[["cell", "time"]].sort_values("time").drop_duplicates()
     unique_times = cell_times["time"].unique()
-    print(f"\nProcessing {len(unique_times)} timesteps ...")
+    section("Intermediate sources")
 
     stage1 = dict(
         sds_px_considered=0,
@@ -892,7 +774,6 @@ def run_intermediate_detection(
                 })
 
     # ---- Save ----
-    print("\nSaving ...")
     for var in (v_i, v_r, v_f, v_ft):
         _flush(var)
 
@@ -926,7 +807,7 @@ def run_intermediate_detection(
         })
         origins["time"] = pd.to_datetime(origins["time"])
     else:
-        print(f"  WARNING: {s1_sources_csv.name} not found — combined CSV will have intermediates only")
+        print(f"  WARNING: {s1_sources_csv.name} not found, sds_all_sources.csv has intermediates only")
         origins = pd.DataFrame()
 
     if source_rows:
@@ -942,9 +823,7 @@ def run_intermediate_detection(
 
     n_origin = int((all_sources["source_type"] == "origin").sum())       if len(all_sources) else 0
     n_interm = int((all_sources["source_type"] == "intermediate").sum()) if len(all_sources) else 0
-    print(f"  Combined sources: {len(all_sources):,} "
-          f"({n_origin:,} origin, {n_interm:,} intermediate)")
-    print(f"  → sds_all_sources.csv")
+    print(f"  Saved: sds_all_sources.csv ({n_origin:,} origin, {n_interm:,} intermediate)")
 
     pixel_log_rows = [{"filter": k, "n_pixels": v} for k, v in stage1.items()]
     pd.DataFrame(pixel_log_rows).to_csv(out_dir / "sds_pixel_filter_log.csv", index=False)
@@ -954,34 +833,37 @@ def run_intermediate_detection(
         return f"{100*a/b:.1f}%" if b > 0 else "n/a"
 
     tot = stage1["sds_px_considered"]
-    print(f"\n── Pixel funnel ──")
-    print(f"  SDS+ pixels considered           : {tot:>12,}")
-    print(f"  No t-1 plume                     : {stage1['cell_no_t1_plume']:>12,}  ({_pct(stage1['cell_no_t1_plume'], tot)})")
-    print(f"  Non-finite AE/DUAOD              : {stage1['px_nonfinite']:>12,}  ({_pct(stage1['px_nonfinite'], tot)})")
-    print(f"  Fail AE                          : {stage1['px_fail_ae']:>12,}  ({_pct(stage1['px_fail_ae'], tot)})")
+    section("Summary")
+    print("  Pixel funnel")
+    print(f"    SDS+ pixels considered           : {tot:>12,}")
+    print(f"    No t-1 plume                     : {stage1['cell_no_t1_plume']:>12,}  ({_pct(stage1['cell_no_t1_plume'], tot)})")
+    print(f"    Non-finite AE/DUAOD              : {stage1['px_nonfinite']:>12,}  ({_pct(stage1['px_nonfinite'], tot)})")
+    print(f"    Fail AE                          : {stage1['px_fail_ae']:>12,}  ({_pct(stage1['px_fail_ae'], tot)})")
     if stage1["px_no_upwind"] > 0:
-        print(f"  Upwind out-of-bounds             : {stage1['px_no_upwind']:>12,}  ({_pct(stage1['px_no_upwind'], tot)})")
+        print(f"    Upwind out-of-bounds             : {stage1['px_no_upwind']:>12,}  ({_pct(stage1['px_no_upwind'], tot)})")
     if stage1["px_fallback"] > 0:
-        print(f"  Upwind fallback to plume-ref     : {stage1['px_fallback']:>12,}  ({_pct(stage1['px_fallback'], tot)})")
-    print(f"  Passed dust signal               : {stage1['px_passed_dust_signal']:>12,}  ({_pct(stage1['px_passed_dust_signal'], tot)})")
+        print(f"    Upwind fallback to plume-ref     : {stage1['px_fallback']:>12,}  ({_pct(stage1['px_fallback'], tot)})")
+    print(f"    Passed dust signal               : {stage1['px_passed_dust_signal']:>12,}  ({_pct(stage1['px_passed_dust_signal'], tot)})")
 
     if filter_log:
         df_fl = pd.DataFrame(filter_log)
         tc = int(df_fl["n_candidates"].sum())
         tk = int(df_fl["n_kept"].sum())
-        print(f"\n── Emission filter (of {tc:,} dust-signal candidates) ──")
-        print(f"  Kept                             : {tk:>12,}  ({_pct(tk, tc)})")
-        print(f"  Failed ws_mean (< {ws_mean_thr})       : {int(df_fl['n_failed_ws_mean'].sum()):>12,}  ({_pct(int(df_fl['n_failed_ws_mean'].sum()), tc)})")
-        print(f"  Failed ws_max  (< {ws_max_thr})        : {int(df_fl['n_failed_ws_max'].sum()):>12,}  ({_pct(int(df_fl['n_failed_ws_max'].sum()), tc)})")
-        print(f"  Failed NDVI (>= {ndvi_thr})          : {int(df_fl['n_failed_ndvi'].sum()):>12,}  ({_pct(int(df_fl['n_failed_ndvi'].sum()), tc)})")
-        print(f"  Failed snow (>= {snow_thr})          : {int(df_fl['n_failed_snow'].sum()):>12,}  ({_pct(int(df_fl['n_failed_snow'].sum()), tc)})")
-        print(f"  Failed land                      : {int(df_fl['n_failed_land'].sum()):>12,}  ({_pct(int(df_fl['n_failed_land'].sum()), tc)})")
+        print(f"  Emission filter (of {tc:,} dust-signal candidates)")
+        for label, n in [
+            ("Kept", tk),
+            (f"Failed ws_mean (< {ws_mean_thr})", int(df_fl["n_failed_ws_mean"].sum())),
+            (f"Failed ws_max (< {ws_max_thr})", int(df_fl["n_failed_ws_max"].sum())),
+            (f"Failed NDVI (>= {ndvi_thr})", int(df_fl["n_failed_ndvi"].sum())),
+            (f"Failed snow (>= {snow_thr})", int(df_fl["n_failed_snow"].sum())),
+            ("Failed land", int(df_fl["n_failed_land"].sum())),
+        ]:
+            print(f"    {label:<33}: {n:>12,}  ({_pct(n, tc)})")
 
-    print(f"\n  Intermediate clusters: {len(source_rows):,}")
-    print(f"  Intermediate pixels:  {sum(r['n_pixels'] for r in source_rows):,}")
+    print(f"  Intermediate sources: {len(source_rows):,} clusters, "
+          f"{sum(r['n_pixels'] for r in source_rows):,} pixels")
 
     wall_elapsed = _time.time() - wall_start
-    print(f"\nRun complete in {wall_elapsed / 60:.1f} minutes")
 
     # ---- Experiment summary ----
     emf_candidates = emf_kept = 0
@@ -1030,7 +912,7 @@ def run_intermediate_detection(
         "output_dir":    str(out_dir),
     }
 
-    exp_csv = _experiment_summary_path()
+    exp_csv = STEP2_SUMMARY_CSV
     exp_csv.parent.mkdir(parents=True, exist_ok=True)
     row_df = pd.DataFrame([experiment_row])
     if exp_csv.exists():
@@ -1039,7 +921,7 @@ def run_intermediate_detection(
     else:
         combined = row_df
     combined.to_csv(exp_csv, index=False)
-    print(f"Experiment summary appended -> {exp_csv}")
+    done(f"{project_relative(out_dir)} ({wall_elapsed / 60:.1f} min)")
 
     sys.stdout = logger.terminal
     logger.close()
@@ -1058,40 +940,40 @@ def parse_args():
         description="SDS Intermediate Source Detection — grid search runner.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python backtrace_intermediate_regions.py --ws_max_thr 7.0 8.0 --dry_run
-  python backtrace_intermediate_regions.py --delta_ae 0.01 0.02 0.03
-  python backtrace_intermediate_regions.py --upwind_plume_k 3 4 5
+  python detect_intermediate_sources.py --ws_max_thr 7.0 8.0 --dry_run
+  python detect_intermediate_sources.py --delta_ae 0.01 0.02 0.03
+  python detect_intermediate_sources.py --upwind_plume_k 3 4 5
 """,
     )
     # Step 1 selection
-    p.add_argument("--resolution", nargs="+", default=["daily"])
-    p.add_argument("--grid_res",   nargs="+", type=float, default=[0.25])
-    p.add_argument("--s1_angstr",  nargs="+", type=float, default=[0.4])
-    p.add_argument("--s1_duaod",   nargs="+", type=float, default=[0.3])
-    p.add_argument("--s1_pm10",    nargs="+", type=float, default=[1.5e-7])
-    p.add_argument("--s1_min_px",  nargs="+", type=int,   default=[0])
-    p.add_argument("--s1_iou",     nargs="+", type=float, default=[0.25])
-    p.add_argument("--s1_max_gap", nargs="+", type=int,   default=[0])
-    p.add_argument("--s1_stubs",   nargs="+", type=int,   default=[0])
-    p.add_argument("--s1_memory",  nargs="+", type=int,   default=[0])
+    p.add_argument("--resolution", nargs="+", default=[RESOLUTION])
+    p.add_argument("--grid_res",   nargs="+", type=float, default=[SPATIAL_RES])
+    p.add_argument("--s1_angstr",  nargs="+", type=float, default=[S1["angstr"]])
+    p.add_argument("--s1_duaod",   nargs="+", type=float, default=[S1["duaod"]])
+    p.add_argument("--s1_pm10",    nargs="+", type=float, default=[S1["pm10"]])
+    p.add_argument("--s1_min_px",  nargs="+", type=int,   default=[S1["min_pixels"]])
+    p.add_argument("--s1_iou",     nargs="+", type=float, default=[S1["iou"]])
+    p.add_argument("--s1_max_gap", nargs="+", type=int,   default=[S1["max_gap"]])
+    p.add_argument("--s1_stubs",   nargs="+", type=int,   default=[S1["stubs"]])
+    p.add_argument("--s1_memory",  nargs="+", type=int,   default=[S1["memory"]])
 
     # Step 2 params (sweepable)
-    p.add_argument("--ws_mean_thr",  nargs="+", type=float, default=[5.0],
+    p.add_argument("--ws_mean_thr",  nargs="+", type=float, default=[S2["ws_mean_thr"]],
                    help="Mean wind speed threshold at NDVI=ndvi_thr (m/s)")
-    p.add_argument("--ws_max_thr",   nargs="+", type=float, default=[7.0],
+    p.add_argument("--ws_max_thr",   nargs="+", type=float, default=[S2["ws_max_thr"]],
                    help="Max wind speed threshold at NDVI=ndvi_thr (m/s)")
-    p.add_argument("--ws_mean_base", nargs="+", type=float, default=[3.0],
+    p.add_argument("--ws_mean_base", nargs="+", type=float, default=[S2["ws_mean_base"]],
                    help="ws_mean threshold at NDVI=0 (bare surface)")
-    p.add_argument("--ws_max_base",  nargs="+", type=float, default=[4.0],
+    p.add_argument("--ws_max_base",  nargs="+", type=float, default=[S2["ws_max_base"]],
                    help="ws_max threshold at NDVI=0 (bare surface)")
-    p.add_argument("--ndvi_thr",     nargs="+", type=float, default=[0.15])
-    p.add_argument("--snow_thr",     nargs="+", type=float, default=[0.25])
-    p.add_argument("--delta_ae",     nargs="+", type=float, default=[0.02])
-    p.add_argument("--min_cluster",  nargs="+", type=int,   default=[0])
-    p.add_argument("--ref_stat",     nargs="+", default=["median"],
+    p.add_argument("--ndvi_thr",     nargs="+", type=float, default=[S2["ndvi_thr"]])
+    p.add_argument("--snow_thr",     nargs="+", type=float, default=[S2["snow_thr"]])
+    p.add_argument("--delta_ae",     nargs="+", type=float, default=[S2["delta_ae"]])
+    p.add_argument("--min_cluster",  nargs="+", type=int,   default=[S2["min_cluster"]])
+    p.add_argument("--ref_stat",     nargs="+", default=[S2["ref_stat"]],
                    help="Reference statistic for K-neighbour AE aggregation "
                         "and plume-wide AE fallback: mean, median, p25, p50, p75")
-    p.add_argument("--upwind_plume_k", nargs="+", type=int, default=[4],
+    p.add_argument("--upwind_plume_k", nargs="+", type=int, default=[S2["upwind_plume_k"]],
                    help="Number of nearest predecessor-plume pixels (default: 4)")
 
     p.add_argument("--dry_run", action="store_true")
@@ -1123,18 +1005,16 @@ def main():
     combos = build_grid(args)
 
     n = len(combos)
-    print(f"Parameter grid: {n} combination{'s' if n != 1 else ''}")
-    for i, c in enumerate(combos):
-        print(f"  [{i+1:3d}] {c}")
-
+    if n > 1 or args.dry_run:
+        print(f"Parameter grid: {n} run{'s' if n != 1 else ''}")
+        for i, c in enumerate(combos):
+            print(f"  [{i+1:3d}] {c}")
     if args.dry_run:
-        print("\n--dry_run set, exiting.")
         return
 
     for idx, combo in enumerate(combos):
-        print(f"\n{'#' * 72}")
-        print(f"# Experiment {idx + 1} / {n}")
-        print(f"{'#' * 72}\n")
+        if n > 1:
+            print(f"\nRun {idx + 1} / {n}")
 
         run_intermediate_detection(
             resolution=combo["resolution"],
@@ -1160,8 +1040,8 @@ def main():
         )
         gc.collect()
 
-    print(f"\nAll done. {n} experiments completed.")
-    print(f"Summary: {_experiment_summary_path()}")
+    if n > 1:
+        print(f"\nAll {n} runs finished, summary: {project_relative(STEP2_SUMMARY_CSV)}")
 
 
 if __name__ == "__main__":

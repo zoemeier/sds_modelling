@@ -12,7 +12,7 @@ This teaches the model to better distinguish "looks like dust but isn't"
 from actual dust events.
 
 Usage:
-  python retrain_boundary.py --model_dir models/final_rf_v1_20260413_120000
+  python retrain_boundary.py --model_dir models/final_rf_<timestamp>
 """
 
 import argparse
@@ -33,14 +33,15 @@ import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
-from config import (
-    LOGS_PATH, MODELS_PATH,
-    RESOLUTION, SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS, SDS_PATH,
-    FINAL_RF_PARAMS,
-    BOUNDARY_NEG_THRESHOLD, BOUNDARY_OVERSAMPLE_FACTOR, BOUNDARY_NEG_TOTAL,
+from sds.config import (
+    VAL_CALIB_FRAC, VAL_SPLIT_SEED, MODELS_PATH, RESOLUTION,
+    SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
+    FINAL_RF_PARAMS, BOUNDARY_NEG_THRESHOLD, BOUNDARY_OVERSAMPLE_FACTOR, BOUNDARY_NEG_TOTAL,
     BOUNDARY_RF_PARAMS, BOUNDARY_TAG, BOUNDARY_SEED,
 )
-from data_utils import (
+from sds.paths import model_figures_dir, project_relative, resolve_path, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     collect_indices, extract_from_cache,
     platt_fit, platt_apply, compute_metrics, find_best_threshold,
@@ -79,10 +80,9 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    model_dir = Path(args.model_dir)
+    model_dir = resolve_path(args.model_dir)
     if not model_dir.exists():
-        print(f"ERROR: model_dir not found: {model_dir}")
-        sys.exit(1)
+        sys.exit(f"ERROR: model_dir not found: {model_dir}")
 
     # ── Load base model ───────────────────────────────────────────────────
     base_rf = joblib.load(model_dir / "rf_model.joblib")
@@ -100,7 +100,7 @@ def main():
     train_years = args.train_years or data_cfg.get("train_years", TRAIN_YEARS)
     val_years = args.val_years or data_cfg.get("val_years", VAL_YEARS)
     test_years = args.test_years or data_cfg.get("test_years", TEST_YEARS)
-    sds_path = args.sds_path or data_cfg.get("sds_path") or SDS_PATH
+    sds_path = resolve_path(args.sds_path or data_cfg.get("sds_path") or SDS_PATH)
     tag = args.tag or BOUNDARY_TAG
     seed = args.seed or BOUNDARY_SEED
 
@@ -113,13 +113,9 @@ def main():
 
     rf_params = dict(BOUNDARY_RF_PARAMS or FINAL_RF_PARAMS)
 
-    if sds_path is None:
-        print("ERROR: No SDS path")
-        sys.exit(1)
     sds_file = Path(sds_path)
     if not sds_file.exists():
-        print(f"ERROR: SDS file not found: {sds_file}")
-        sys.exit(1)
+        sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
 
     # ── Output directory ──────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -139,23 +135,14 @@ def main():
     )
     logger = logging.getLogger("boundary_retrain")
 
-    logger.info("=" * 60)
-    logger.info("FP-FOCUSED BOUNDARY RETRAINING")
-    logger.info("=" * 60)
-    logger.info(f"  Base model: {model_dir}")
-    logger.info(f"  Base threshold: {base_thr:.4f}")
-    logger.info(f"  Hard negative threshold: prob > {neg_threshold}")
-    logger.info(f"  Oversample factor: {oversample_factor}x")
-    logger.info(f"  Negative budget: {neg_total:,}")
-    logger.info(f"  Positives: ALL (no cap)")
-    logger.info(f"  Seed: {seed}")
-    logger.info(f"  Tag: {tag}")
-    logger.info(f"  Output: {out_dir}")
-    logger.info(f"\n  RF params:")
-    for k, v in sorted(rf_params.items()):
-        if k not in ("n_jobs", "verbose"):
-            logger.info(f"    {k}: {v}")
-    logger.info("=" * 60)
+    header("Boundary retraining", {
+        "Base model": f"{project_relative(model_dir)} (threshold {base_thr:.4f})",
+        "Hard negatives": f"prob > {neg_threshold}, oversampled {oversample_factor}x",
+        "Negatives sampled": f"{neg_total:,} (all positives kept), seed {seed}",
+        "RF params": ", ".join(f"{k}={v}" for k, v in sorted(rf_params.items())
+                               if k not in ("n_jobs", "verbose")),
+        "Output": project_relative(out_dir),
+    }, out=logger.info)
 
     # ── Load features ─────────────────────────────────────────────────────
     cache = FeatureCache(
@@ -172,17 +159,15 @@ def main():
     land_indices = compute_land_indices(
         ds_sds["latitude"].values, ds_sds["longitude"].values)
 
-    logger.info("\nCollecting TRAIN indices ...")
+    section("Samples", out=logger.info)
     train_pos, train_neg = collect_indices(
-        cache, cache.train_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.train_years, ds_sds, sds_var, land_indices, logger, label="Train")
 
-    logger.info("\nCollecting VAL indices ...")
     val_pos, val_neg = collect_indices(
-        cache, cache.val_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.val_years, ds_sds, sds_var, land_indices, logger, label="Val")
 
-    logger.info("\nCollecting TEST indices ...")
     test_pos, test_neg = collect_indices(
-        cache, cache.test_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.test_years, ds_sds, sds_var, land_indices, logger, label="Test")
 
     ds_sds.close()
     del ds_sds
@@ -190,15 +175,11 @@ def main():
 
     n_pos = len(train_pos)
     n_neg = len(train_neg)
-    logger.info(f"\n  Positives: {n_pos:,} (keeping ALL)")
-    logger.info(f"  Negatives: {n_neg:,} (will sample {neg_total:,})")
 
     # ---------------------------------------------------------------------------
     # Step 1: Score NEGATIVES only with base model
     # ---------------------------------------------------------------------------
-    logger.info(f"\n{'='*60}")
-    logger.info("STEP 1: Scoring negatives with base model")
-    logger.info(f"{'='*60}")
+    section("Step 1: Score training negatives with the base model", out=logger.info)
 
     t0 = time.time()
     batch_size = 1_000_000
@@ -215,10 +196,9 @@ def main():
         gc.collect()
 
         if (end // batch_size) % 10 == 0 or end == n_neg:
-            logger.info(f"    {end:,} / {n_neg:,} scored")
+            logger.info(f"  {end:,} / {n_neg:,}")
 
     t_score = time.time() - t0
-    logger.info(f"  Scoring done in {t_score:.1f}s")
 
     # Free base model memory
     del base_rf, base_platt
@@ -227,25 +207,14 @@ def main():
     # ---------------------------------------------------------------------------
     # Step 2: Compute negative sampling weights
     # ---------------------------------------------------------------------------
-    logger.info(f"\n{'='*60}")
-    logger.info("STEP 2: Computing negative sampling weights")
-    logger.info(f"{'='*60}")
+    section("Step 2: Sampling weights", out=logger.info)
 
     hard_mask = neg_probas > neg_threshold
     n_hard = int(hard_mask.sum())
     n_easy = n_neg - n_hard
 
-    logger.info(f"  Hard negatives (prob > {neg_threshold}): "
-                f"{n_hard:,} ({100*n_hard/n_neg:.2f}%)")
-    logger.info(f"  Easy negatives (prob ≤ {neg_threshold}): "
-                f"{n_easy:,} ({100*n_easy/n_neg:.2f}%)")
-
-    # Probability stats for hard negatives
-    if n_hard > 0:
-        logger.info(f"  Hard neg probability: "
-                    f"mean={neg_probas[hard_mask].mean():.4f}, "
-                    f"median={np.median(neg_probas[hard_mask]):.4f}, "
-                    f"max={neg_probas[hard_mask].max():.4f}")
+    logger.info(f"  Hard negatives (prob > {neg_threshold}): {n_hard:,} ({100*n_hard/n_neg:.2f}%), "
+                f"easy: {n_easy:,}")
 
     # Assign weights
     neg_weights = np.ones(n_neg, dtype=np.float64)
@@ -281,15 +250,13 @@ def main():
     a2.legend()
 
     fig.suptitle("Negative samples — base model predictions", fontsize=13)
-    fig.savefig(out_dir / "negative_probability_distribution.png")
+    fig.savefig(model_figures_dir(out_dir) / "negative_probability_distribution.png")
     plt.close(fig)
 
     # ---------------------------------------------------------------------------
     # Step 3: Sample negatives + keep all positives
     # ---------------------------------------------------------------------------
-    logger.info(f"\n{'='*60}")
-    logger.info("STEP 3: Sampling")
-    logger.info(f"{'='*60}")
+    section("Step 3: Sample the training set", out=logger.info)
 
     rng = np.random.default_rng(seed)
     neg_total_actual = min(neg_total, n_neg)
@@ -301,22 +268,13 @@ def main():
     n_sampled_hard = int(hard_mask[sampled_neg_idx].sum())
     n_sampled_easy = neg_total_actual - n_sampled_hard
 
-    logger.info(f"  Positives: {n_pos:,} (all)")
-    logger.info(f"  Negatives sampled: {neg_total_actual:,}")
-    logger.info(f"    Hard: {n_sampled_hard:,} ({100*n_sampled_hard/neg_total_actual:.1f}%)")
-    logger.info(f"    Easy: {n_sampled_easy:,} ({100*n_sampled_easy/neg_total_actual:.1f}%)")
-    logger.info(f"  Effective ratio: 1:{neg_total_actual // max(n_pos, 1)}")
-
-    total_train = n_pos + neg_total_actual
-    logger.info(f"  Total training samples: {total_train:,} "
-                f"({100*n_pos/total_train:.2f}% pos)")
+    logger.info(f"  Train set: {n_pos:,} pos, {neg_total_actual:,} neg "
+                f"({100*n_sampled_hard/neg_total_actual:.1f}% hard, "
+                f"1:{neg_total_actual // max(n_pos, 1)})")
 
     # Extract features
-    logger.info("  Extracting positive features ...")
-    t0 = time.time()
     X_pos = extract_from_cache(cache, train_pos)
 
-    logger.info("  Extracting negative features ...")
     sampled_neg_indices = [train_neg[i] for i in sampled_neg_idx]
     X_neg = extract_from_cache(cache, sampled_neg_indices)
 
@@ -326,10 +284,6 @@ def main():
         np.zeros(neg_total_actual, dtype=np.float32),
     ])
 
-    t_extract = time.time() - t0
-    logger.info(f"  Extraction done in {t_extract:.1f}s")
-    logger.info(f"  X_train shape: {X_train.shape}")
-
     del X_pos, X_neg, neg_probas, neg_weights, sampled_neg_idx
     del sampled_neg_indices, train_pos, train_neg
     gc.collect()
@@ -337,27 +291,18 @@ def main():
     # ---------------------------------------------------------------------------
     # Step 4: Build val/test sets
     # ---------------------------------------------------------------------------
-    logger.info(f"\n{'='*60}")
-    logger.info("STEP 4: Building val/test sets")
-    logger.info(f"{'='*60}")
-
-    logger.info("  Building val set (full) ...")
     val_indices = val_pos + val_neg
     X_val = extract_from_cache(cache, val_indices)
     y_val = np.concatenate([
         np.ones(len(val_pos), dtype=np.float32),
         np.zeros(len(val_neg), dtype=np.float32),
     ])
-    logger.info(f"  Val: {len(y_val):,} ({int(y_val.sum()):,} pos)")
-
-    logger.info("  Building test set (full) ...")
     test_indices = test_pos + test_neg
     X_test = extract_from_cache(cache, test_indices)
     y_test = np.concatenate([
         np.ones(len(test_pos), dtype=np.float32),
         np.zeros(len(test_neg), dtype=np.float32),
     ])
-    logger.info(f"  Test: {len(y_test):,} ({int(y_test.sum()):,} pos)")
 
     del val_pos, val_neg, test_pos, test_neg, val_indices, test_indices
     gc.collect()
@@ -365,15 +310,13 @@ def main():
     # ---------------------------------------------------------------------------
     # Step 5: Train new RF
     # ---------------------------------------------------------------------------
-    logger.info(f"\n{'='*60}")
-    logger.info("STEP 5: Training FP-focused RF")
-    logger.info(f"{'='*60}")
+    section("Step 4: Train", out=logger.info)
 
     t0 = time.time()
     rf = RandomForestClassifier(**rf_params)
     rf.fit(X_train, y_train)
     t_train = time.time() - t0
-    logger.info(f"  RF trained in {t_train:.1f}s")
+    logger.info(f"  Trained in {t_train / 60:.1f} min")
 
     # Feature importances
     imp = rf.feature_importances_
@@ -383,10 +326,6 @@ def main():
     }).sort_values("importance", ascending=False).reset_index(drop=True)
     feat_df["rank"] = range(1, len(feat_df) + 1)
 
-    logger.info(f"\n  Top 15 features:")
-    for _, row in feat_df.head(15).iterrows():
-        logger.info(f"    {row['rank']:3d}. {row['feature']:<35s} "
-                     f"{row['importance']:.6f}")
 
     del X_train, y_train
     gc.collect()
@@ -394,9 +333,7 @@ def main():
     # ---------------------------------------------------------------------------
     # Step 6: Platt calibration + evaluation
     # ---------------------------------------------------------------------------
-    logger.info(f"\n{'='*60}")
-    logger.info("STEP 6: Calibration and evaluation")
-    logger.info(f"{'='*60}")
+    section("Step 5: Calibrate and evaluate", out=logger.info)
 
     proba_val_raw = rf.predict_proba(X_val)[:, 1]
 
@@ -404,7 +341,7 @@ def main():
     if len(unique_val) >= 2 and int(y_val.sum()) >= 4:
         val_idx = np.arange(len(y_val))
         cal_idx, eval_idx = train_test_split(
-            val_idx, test_size=0.5, stratify=y_val, random_state=42)
+            val_idx, test_size=VAL_CALIB_FRAC, stratify=y_val, random_state=VAL_SPLIT_SEED)
 
         platt_lr = platt_fit(y_val[cal_idx], proba_val_raw[cal_idx])
         proba_eval_cal = platt_apply(platt_lr, proba_val_raw[eval_idx])
@@ -417,13 +354,9 @@ def main():
         val_m_uncal = compute_metrics(y_val[eval_idx],
                                        proba_val_raw[eval_idx], thr_uncal)
 
-        logger.info(f"  VAL (calibrated,   thr={thr:.4f}): "
-                    f"F1={val_m['f1']:.4f}  P={val_m['precision']:.4f}  "
-                    f"R={val_m['recall']:.4f}  AUC={val_m['auc']:.4f}")
-        logger.info(f"  VAL (uncalibrated, thr={thr_uncal:.4f}): "
-                    f"F1={val_m_uncal['f1']:.4f}  "
-                    f"P={val_m_uncal['precision']:.4f}  "
-                    f"R={val_m_uncal['recall']:.4f}")
+        logger.info(f"  Val:  F1={val_m['f1']:.4f}  P={val_m['precision']:.4f}  "
+                    f"R={val_m['recall']:.4f}  AUC={val_m['auc']:.4f}  thr={thr:.4f} "
+                    f"(uncalibrated F1={val_m_uncal['f1']:.4f})")
     else:
         platt_lr = None
         thr = find_best_threshold(y_val, proba_val_raw)
@@ -440,26 +373,14 @@ def main():
         proba_test = proba_test_raw
 
     test_m = compute_metrics(y_test, proba_test, thr)
-    logger.info(f"  TEST (thr={thr:.4f}): "
-                f"F1={test_m['f1']:.4f}  P={test_m['precision']:.4f}  "
+    logger.info(f"  Test: F1={test_m['f1']:.4f}  P={test_m['precision']:.4f}  "
                 f"R={test_m['recall']:.4f}  AUC={test_m['auc']:.4f}")
 
     # Comparison with base model
     base_val = base_results.get("val_metrics", {})
     base_test = base_results.get("test_metrics", {})
-    logger.info(f"\n  Comparison with base model:")
-    logger.info(f"    Base  val  F1={base_val.get('f1', 0):.4f}  "
-                f"P={base_val.get('precision', 0):.4f}  "
-                f"R={base_val.get('recall', 0):.4f}")
-    logger.info(f"    New   val  F1={val_m['f1']:.4f}  "
-                f"P={val_m['precision']:.4f}  "
-                f"R={val_m['recall']:.4f}")
-    logger.info(f"    Base  test F1={base_test.get('f1', 0):.4f}  "
-                f"P={base_test.get('precision', 0):.4f}  "
-                f"R={base_test.get('recall', 0):.4f}")
-    logger.info(f"    New   test F1={test_m['f1']:.4f}  "
-                f"P={test_m['precision']:.4f}  "
-                f"R={test_m['recall']:.4f}")
+    logger.info(f"  Base model test: F1={base_test.get('f1', 0):.4f}  "
+                f"P={base_test.get('precision', 0):.4f}  R={base_test.get('recall', 0):.4f}")
 
     # Metrics at thresholds
     from sklearn.metrics import precision_recall_curve
@@ -483,23 +404,12 @@ def main():
         thr_table.append(m)
     thr_df = pd.DataFrame(thr_table)
 
-    logger.info(f"\n  Metrics at selected thresholds (test):")
-    logger.info(f"  {'Thr':>6s} {'F1':>7s} {'Prec':>7s} {'Rec':>7s} "
-                f"{'TP':>8s} {'FP':>8s} {'FN':>8s}")
-    logger.info(f"  {'-'*52}")
-    for _, r in thr_df.iterrows():
-        logger.info(f"  {r['threshold']:6.2f} {r['f1']:7.4f} "
-                    f"{r['precision']:7.4f} {r['recall']:7.4f} "
-                    f"{r['tp']:8.0f} {r['fp']:8.0f} {r['fn']:8.0f}")
-
     del X_test, y_test, proba_test, proba_test_raw
     gc.collect()
 
     # ---------------------------------------------------------------------------
     # Save everything
     # ---------------------------------------------------------------------------
-    logger.info(f"\nSaving to {out_dir} ...")
-
     joblib.dump(rf, out_dir / "rf_model.joblib")
     if platt_lr is not None:
         joblib.dump(platt_lr, out_dir / "platt_scaler.joblib")
@@ -510,7 +420,7 @@ def main():
     results = {
         "tag": tag,
         "timestamp": timestamp,
-        "base_model_dir": str(model_dir),
+        "base_model_dir": project_relative(model_dir),
         "base_threshold": base_thr,
         "train_time_s": round(t_train, 1),
         "score_time_s": round(t_score, 1),
@@ -537,27 +447,13 @@ def main():
             "train_years": train_years,
             "val_years": val_years,
             "test_years": test_years,
-            "sds_path": str(sds_path),
+            "sds_path": project_relative(sds_path),
         },
     }
     results_path = out_dir / "results.json"
     results_path.write_text(json.dumps(results, indent=2, default=str))
 
-    logger.info(f"  All saved.")
-
-    # ── Done ──────────────────────────────────────────────────────────────
-    logger.info(f"\n{'='*60}")
-    logger.info("FP-FOCUSED RETRAINING COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"  Output: {out_dir}")
-    logger.info(f"  Val  F1={val_m['f1']:.4f}  P={val_m['precision']:.4f}  "
-                f"R={val_m['recall']:.4f}")
-    logger.info(f"  Test F1={test_m['f1']:.4f}  P={test_m['precision']:.4f}  "
-                f"R={test_m['recall']:.4f}")
-    logger.info(f"  Threshold: {thr:.4f}")
-    delta_f1 = test_m['f1'] - base_test.get('f1', 0)
-    logger.info(f"  ΔF1 vs base: {delta_f1:+.4f}")
-    logger.info(f"{'='*60}")
+    done(out_dir, out=logger.info)
 
 
 if __name__ == "__main__":

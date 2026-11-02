@@ -1,17 +1,21 @@
 """
 Train an RF with a single feature dropped and measure the F1 drop vs the full model.
 
-Designed to run as one SLURM job per feature (see submit_dropout_array.slurm).
+Workflow:
+  1. run once without --drop_feature -> subsample-matched baseline (dropout/__baseline__/)
+  2. run once per feature with --drop_feature <name> (independent, can run in parallel)
+  3. run aggregate_dropout.py to build the combined figure + CSV
+
 Each invocation is self-contained: it reloads the cache, drops the specified feature,
 retrains, evaluates on val + test, and writes results to a subdirectory.
 
-Use --train_frac to subsample training data for tractability (Option 3 in the analysis plan).
+Use --train_frac to subsample the training data for tractability (default: config.DROPOUT_TRAIN_FRAC).
 The full model baseline is read from main_model_dir/results.json and doesn't need to be retrained.
 
 Usage (one feature at a time):
   python compute_dropout_importance.py \
-      --main_model_dir models/final_rf_v1_20260413_120000 \
-      --drop_feature t2m_mean \
+      --main_model_dir models/final_rf_<timestamp> \
+      --drop_feature t2m \
       --train_frac 0.2
 
 After all jobs finish, run aggregate_dropout.py to build the combined plot.
@@ -23,7 +27,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -34,12 +37,15 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
 
-from config import (
-    RESOLUTION, SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
-    SDS_PATH, FINAL_RF, FINAL_RF_PARAMS,
-    PERM_N_SAMPLES, PERM_N_REPEATS, PERM_SEED,
+from sds.config import (
+    VAL_CALIB_FRAC, DROPOUT_TRAIN_FRAC, VAL_SPLIT_SEED, RESOLUTION,
+    SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
+    FINAL_RF_SAMPLING, FINAL_RF_PARAMS, PERM_N_SAMPLES, PERM_N_REPEATS,
+    PERM_SEED,
 )
-from data_utils import (
+from sds.paths import project_relative, resolve_path, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     collect_indices,
     platt_fit, platt_apply, compute_metrics, find_best_threshold,
@@ -48,7 +54,7 @@ from data_utils import (
 
 
 def _subsample_indices(pos, neg, train_frac, rng):
-    # take a fraction of both pos and neg lists, preserving the pool's ratio
+    # same fraction of positives and negatives, so the pool's ratio is kept
     if train_frac >= 1.0:
         return pos, neg
     n_pos_keep = max(1, int(round(len(pos) * train_frac)))
@@ -67,35 +73,31 @@ def main():
     parser.add_argument("--drop_feature", type=str, default=None,
         help="name of the feature to remove before training. "
              "Omit (or pass __baseline__) to train a subsample-matched baseline instead.")
-    parser.add_argument("--train_frac", type=float, default=0.2,
-        help="fraction of training data to use (default: 0.2 for a ~5x speedup)")
+    parser.add_argument("--train_frac", type=float, default=DROPOUT_TRAIN_FRAC,
+        help=f"fraction of training data to use (default: {DROPOUT_TRAIN_FRAC})")
     parser.add_argument("--out_dir", type=str, default=None,
         help="where to write this run's artefacts (default: main_model_dir/dropout/{feature})")
     parser.add_argument("--seed_offset", type=int, default=0,
-        help="added to FINAL_RF.seed so different features get different seeds")
+        help="added to the FINAL_RF_SAMPLING seed so different features get different seeds")
     args = parser.parse_args()
 
-    # baseline mode: no feature dropped, same subsample fraction - the aggregator compares
-    # real dropout F1s against this instead of the full-model F1 (otherwise the comparison
-    # conflates the dropout effect with the data-size difference)
+    # baseline mode: nothing dropped, same subsample fraction. Dropout runs are
+    # compared against this, not the full-data model, to separate the effect of the
+    # feature from the effect of the smaller training set.
     is_baseline = args.drop_feature is None or args.drop_feature == "__baseline__"
 
-    main_model_dir = Path(args.main_model_dir)
+    main_model_dir = resolve_path(args.main_model_dir)
     if not main_model_dir.exists():
-        print(f"ERROR: main_model_dir not found: {main_model_dir}")
-        sys.exit(1)
+        sys.exit(f"ERROR: main_model_dir not found: {main_model_dir}")
 
-    # read feature list and config from the main run so we stay in lockstep with it
+    # feature list and data config from the main run
     main_results = json.loads((main_model_dir / "results.json").read_text())
     all_feature_vars = main_results["feature_vars"]
     data_cfg = main_results["data_config"]
 
     if not is_baseline and args.drop_feature not in all_feature_vars:
-        print(f"ERROR: '{args.drop_feature}' is not in the main model's feature list")
-        print(f"  Available features: {len(all_feature_vars)} total")
-        sys.exit(1)
+        sys.exit(f"ERROR: '{args.drop_feature}' is not one of the main model's features")
 
-    # build the reduced feature set (this dropout run's "X" columns)
     if is_baseline:
         kept_features = list(all_feature_vars)
         drop_idx = None
@@ -105,12 +107,11 @@ def main():
         drop_idx = all_feature_vars.index(args.drop_feature)
         run_label = args.drop_feature
 
-    # output dir - one per feature so parallel jobs don't collide
+    # one output folder per feature, so parallel runs don't collide
     out_dir = Path(args.out_dir) if args.out_dir else \
         main_model_dir / "dropout" / run_label
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -122,76 +123,61 @@ def main():
     )
     logger = logging.getLogger("dropout")
 
-    logger.info("=" * 60)
-    logger.info("DROPOUT IMPORTANCE — baseline" if is_baseline
-                else "DROPOUT IMPORTANCE — single feature")
-    logger.info("=" * 60)
-    logger.info(f"  Main model:    {main_model_dir}")
-    logger.info(f"  Dropped:       {'(none - baseline)' if is_baseline else args.drop_feature}")
-    logger.info(f"  Features kept: {len(kept_features)} / {len(all_feature_vars)}")
-    logger.info(f"  Train frac:    {args.train_frac}")
-    logger.info(f"  Output:        {out_dir}")
-    logger.info("=" * 60)
+    header("Dropout importance", {
+        "Main model": project_relative(main_model_dir),
+        "Dropped feature": "none (baseline)" if is_baseline else args.drop_feature,
+        "Train fraction": args.train_frac,
+        "Output": project_relative(out_dir),
+    }, out=logger.info)
 
-    # pull data config from the main run (with config.py as fallback for anything missing)
+    # data config from the main run (config.py for anything missing)
     resolution  = data_cfg.get("resolution", RESOLUTION)
     spatial_res = data_cfg.get("spatial_res", SPATIAL_RES)
     train_years = data_cfg.get("train_years", TRAIN_YEARS)
     val_years   = data_cfg.get("val_years", VAL_YEARS)
     test_years  = data_cfg.get("test_years", TEST_YEARS)
-    sds_path    = data_cfg.get("sds_path") or SDS_PATH
+    sds_path    = resolve_path(data_cfg.get("sds_path") or SDS_PATH)
     sds_file    = Path(sds_path)
 
-    # sampling config - same as the main run, with our seed offset
-    sampling_cfg = replace(FINAL_RF, seed=FINAL_RF.seed + args.seed_offset)
+    # sampling as in the main run, with the seed offset
+    sampling_cfg = {**FINAL_RF_SAMPLING, 'seed': FINAL_RF_SAMPLING['seed'] + args.seed_offset}
 
-    # RF params - same as the main run
     rf_params = dict(FINAL_RF_PARAMS)
 
-    # ── Load feature cache ────────────────────────────────────────────────
+    # feature cache
     cache = FeatureCache(
         resolution=resolution, spatial_res=spatial_res,
         train_years=train_years, val_years=val_years, test_years=test_years,
         logger=logger,
     )
 
-    # sanity check: the cache's feature order had better match what was trained on,
-    # otherwise our drop_idx will point at the wrong column
+    # the cache's feature order must match the main run, or drop_idx points at the wrong column
     if cache.feature_vars != all_feature_vars:
-        logger.error("Feature order mismatch between cache and main model — aborting")
-        logger.error(f"  Cache:      {cache.feature_vars[:5]} ...")
-        logger.error(f"  Main model: {all_feature_vars[:5]} ...")
-        sys.exit(1)
+        sys.exit("ERROR: feature files and main model have a different feature order")
 
-    # ── SDS + indices ─────────────────────────────────────────────────────
+    # SDS labels + indices
     ds_sds, sds_var = load_sds_source(sds_file, logger)
     land_indices = compute_land_indices(
         ds_sds["latitude"].values, ds_sds["longitude"].values)
 
-    logger.info("\nCollecting TRAIN indices ...")
+    section("Samples", out=logger.info)
     train_pos, train_neg = collect_indices(
-        cache, cache.train_years, ds_sds, sds_var, land_indices, logger)
-    logger.info("\nCollecting VAL indices ...")
+        cache, cache.train_years, ds_sds, sds_var, land_indices, logger, label="Train")
     val_pos, val_neg = collect_indices(
-        cache, cache.val_years, ds_sds, sds_var, land_indices, logger)
-    logger.info("\nCollecting TEST indices ...")
+        cache, cache.val_years, ds_sds, sds_var, land_indices, logger, label="Val")
     test_pos, test_neg = collect_indices(
-        cache, cache.test_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.test_years, ds_sds, sds_var, land_indices, logger, label="Test")
 
     ds_sds.close(); del ds_sds; gc.collect()
 
-    # ── Build datasets (Option 3: subsample the train pool) ───────────────
-    rng = np.random.default_rng(sampling_cfg.seed)
+    # datasets (training pool subsampled by --train_frac)
+    rng = np.random.default_rng(sampling_cfg['seed'])
     if args.train_frac < 1.0:
-        logger.info(f"\nSubsampling train pool to {args.train_frac:.0%} "
-                    f"({len(train_pos):,} pos, {len(train_neg):,} neg before)")
         train_pos, train_neg = _subsample_indices(
             train_pos, train_neg, args.train_frac, rng)
-        logger.info(f"  After: {len(train_pos):,} pos, {len(train_neg):,} neg")
+        logger.info(f"  Train pool subsampled to {args.train_frac:.0%}: "
+                    f"{len(train_pos):,} pos, {len(train_neg):,} neg")
 
-    logger.info("\nBuilding train/val/test sets ...")
-
-    # train - apply the main sampling config on the (possibly subsampled) pool
     X_train, y_train, n_pos = build_train_set(
         cache, train_pos, train_neg, sampling_cfg, logger)
     X_val, y_val = build_eval_set(
@@ -202,33 +188,25 @@ def main():
     del train_pos, train_neg, val_pos, val_neg, test_pos, test_neg
     gc.collect()
 
-    # drop the target column everywhere - this is the "dropout" step itself.
-    # in baseline mode there's nothing to drop, we just keep the full feature set
+    # remove the dropped feature (nothing to remove in baseline mode)
     if not is_baseline:
         X_train = np.delete(X_train, drop_idx, axis=1)
         X_val   = np.delete(X_val,   drop_idx, axis=1)
         X_test  = np.delete(X_test,  drop_idx, axis=1)
 
-    logger.info(f"\n  Train: {X_train.shape[0]:,} × {X_train.shape[1]} "
-                f"({n_pos:,} pos / {len(y_train) - n_pos:,} neg)")
-    logger.info(f"  Val:   {X_val.shape[0]:,} × {X_val.shape[1]}")
-    logger.info(f"  Test:  {X_test.shape[0]:,} × {X_test.shape[1]}")
-
-    # ── Train ─────────────────────────────────────────────────────────────
-    logger.info("\nTraining RF (baseline, no drop)..." if is_baseline
-                else "\nTraining RF (one feature dropped) ...")
+    # train
+    section("Train and evaluate", out=logger.info)
     t0 = time.time()
     rf = RandomForestClassifier(**rf_params)
     rf.fit(X_train, y_train)
     t_train = time.time() - t0
-    logger.info(f"  Trained in {t_train:.1f}s")
+    logger.info(f"  Trained in {t_train / 60:.1f} min")
 
     del X_train, y_train; gc.collect()
 
-    # ── Platt calibration + threshold tuning on val ───────────────────────
-    # same protocol as train_final_rf.py so the F1 numbers are comparable
+    # Platt calibration + threshold tuning on val (same as train_final_rf.py)
     X_cal, X_eval, y_cal, y_eval = train_test_split(
-        X_val, y_val, test_size=0.5, stratify=y_val, random_state=42)
+        X_val, y_val, test_size=VAL_CALIB_FRAC, stratify=y_val, random_state=VAL_SPLIT_SEED)
     proba_cal = rf.predict_proba(X_cal)[:, 1]
     platt_lr = platt_fit(y_cal, proba_cal)
     proba_eval = platt_apply(platt_lr, rf.predict_proba(X_eval)[:, 1])
@@ -237,26 +215,23 @@ def main():
     del X_cal, X_eval, y_cal, y_eval, proba_cal, proba_eval, X_val, y_val
     gc.collect()
 
-    logger.info(f"  VAL:  F1={val_metrics['f1']:.4f}  "
+    logger.info(f"  Val:  F1={val_metrics['f1']:.4f}  "
                 f"P={val_metrics['precision']:.4f}  R={val_metrics['recall']:.4f}  "
                 f"thr={thr:.4f}")
 
-    # ── Evaluate on test ──────────────────────────────────────────────────
+    # evaluate on test
     test_proba = platt_apply(platt_lr, rf.predict_proba(X_test)[:, 1])
     test_metrics = compute_metrics(y_test, test_proba, thr)
 
-    logger.info(f"  TEST: F1={test_metrics['f1']:.4f}  "
+    logger.info(f"  Test: F1={test_metrics['f1']:.4f}  "
                 f"P={test_metrics['precision']:.4f}  R={test_metrics['recall']:.4f}")
 
-    # ── Matched-subsample permutation importance (baseline run only) ──────
-    # reuses the RF we just trained so the permutation panel and the dropout panel of the
-    # final figure are measuring importance on equivalent underlying models - otherwise the
-    # comparison conflates the method (perm vs dropout) with the data-size difference
+    # permutation importance on the baseline RF (baseline run only), so it is
+    # compared with dropout on the same training subsample
     perm_df = None
     if is_baseline:
-        logger.info(f"\nComputing matched-subsample permutation importance "
-                    f"(n={PERM_N_SAMPLES:,}, repeats={PERM_N_REPEATS}) ...")
-        # stratified subsample of the test set, same shape as compute_permutation_importance.py
+        section("Permutation importance (same training subsample)", out=logger.info)
+        # stratified test subsample, as in compute_permutation_importance.py
         rng_perm = np.random.default_rng(PERM_SEED)
         n_test = len(y_test)
         n_perm = min(PERM_N_SAMPLES, n_test)
@@ -275,14 +250,7 @@ def main():
         else:
             X_perm, y_perm = X_test, y_test
 
-        # custom scorer: route every permutation through the full deployed pipeline
-        # (RF -> Platt -> threshold -> F1) rather than rf.score()'s uncalibrated default.
-        # Threshold is held at the baseline's tuned value because permutation asks a
-        # deployment-time question: "if feature X got corrupted at inference time, how
-        # much F1 would I lose at the threshold I already chose?" - at deployment we
-        # don't know in advance which feature will fail, so the threshold is fixed.
-        # (Dropout is different: dropout models are retrained without the feature, so
-        # their val data also lacks it, so per-run retuning is the fair measure there.)
+        # RF -> Platt -> fixed threshold -> F1, as in compute_permutation_importance.py
         def calibrated_f1_scorer(estimator, X_s, y_s):
             proba_raw = estimator.predict_proba(X_s)[:, 1]
             proba_cal = platt_apply(platt_lr, proba_raw)
@@ -296,9 +264,7 @@ def main():
             n_repeats=PERM_N_REPEATS,
             random_state=PERM_SEED, n_jobs=1,
         )
-        logger.info(f"  Done in {time.time() - t_perm:.1f}s")
-        logger.info(f"  Baseline F1 on perm subset (calibrated): "
-                    f"{calibrated_f1_scorer(rf, X_perm, y_perm):.4f}")
+        logger.info(f"  Computed in {(time.time() - t_perm) / 60:.1f} min")
 
         perm_df = pd.DataFrame({
             "feature": cache.feature_vars,
@@ -312,11 +278,7 @@ def main():
 
     del X_test, y_test, test_proba; gc.collect()
 
-    # ── Save results ──────────────────────────────────────────────────────
-    # note: we don't compute delta_f1 here anymore - the aggregator does that by comparing
-    # each dropout run against the *matched-subsample baseline* run (same train_frac, no
-    # features dropped). comparing against the main model's full-data F1 would conflate the
-    # dropout effect with the data-size effect.
+    # save results (delta F1 against the baseline is computed in aggregate_dropout.py)
     full_model_f1 = main_results["test_metrics"]["f1"]
 
     results = {
@@ -329,27 +291,20 @@ def main():
         "threshold": thr,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
-        "full_model_test_f1": full_model_f1,   # kept for reference only
-        "main_model_dir": str(main_model_dir),
-        "sampling_config": asdict(sampling_cfg),
+        "full_model_test_f1": full_model_f1,  # for reference
+        "main_model_dir": project_relative(main_model_dir),
+        "sampling_config": dict(sampling_cfg),
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
     }
     (out_dir / "results.json").write_text(
         json.dumps(results, indent=2, default=str))
 
-    # save the matched-subsample permutation CSV so the aggregator can use it for panel (a)
+    # permutation CSV for panel (a) of aggregate_dropout.py
     if perm_df is not None:
         perm_path = out_dir / "permutation_importance_matched.csv"
         perm_df.to_csv(perm_path, index=False)
-        logger.info(f"  Matched-subsample permutation saved: {perm_path}")
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"DONE - {run_label}")
-    logger.info(f"  Full-model F1 (ref):   {full_model_f1:.4f}")
-    logger.info(f"  This run's test F1:    {test_metrics['f1']:.4f}")
-    logger.info(f"  (Δ F1 computed later by aggregate_dropout.py)")
-    logger.info(f"  Output: {out_dir}")
-    logger.info(f"{'='*60}")
+    done(out_dir, out=logger.info)
 
 
 if __name__ == "__main__":

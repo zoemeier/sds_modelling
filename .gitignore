@@ -1,2 +1,22 @@
 # macOS
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+
+# editors
+.vscode/
+.idea/
+
+# local data, outputs and credentials (never commit)
+passwords.json
+.env
+data/
+models/
+logs/
+figures/

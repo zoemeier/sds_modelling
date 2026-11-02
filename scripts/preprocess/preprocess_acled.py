@@ -1,16 +1,13 @@
 """
 Build gridded ACLED conflict features at a configurable temporal/spatial
-resolution.
+resolution from the raw events downloaded by scripts/download/download_acled.py
+(data/acled/acled_raw_events.csv).
 
-Pipeline:
-  Step 1: download raw events from the ACLED API (cached as CSV; resolution
-          independent).
-  Step 2: snap events to the target grid, compute daily counts and rolling
-          window sums (30/180/365 days), apply log1p, and broadcast to the
-          target temporal resolution if sub-daily.
-
-For sub-daily resolutions, daily counts are repeated at each sub-daily
-timestep — conflict is treated as a daily-scale signal.
+Events are snapped to the nearest cell of the model grid (read from the native
+ERA5 / CAMS files via sds.grid.make_target_grid), counted per day, and turned
+into rolling window sums (30/180/365 days) with log1p. For sub-daily
+resolutions, daily counts are repeated at each sub-daily timestep — conflict is
+treated as a daily-scale signal.
 
 Output variables (all log1p):
     acled_total_count_log1p
@@ -23,135 +20,41 @@ Usage:
     python preprocess_acled.py -r 6h -s 0.75
 """
 
-import os
-import json
 import argparse
-import time as _time
-from pathlib import Path
 
-import requests
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from grid_config import RESOLUTION_CONFIG, make_target_grid, file_tag
+from sds.config import (
+    SUPPORTED_SPATIAL_RES, RESOLUTION, SPATIAL_RES, RESOLUTION_CONFIG,
+    ACLED_PATH, ACLED_RAW_EVENTS, YEARS,
+)
+from sds.paths import file_tag, ACLED_YEARS_TAG
+from sds.grid import make_target_grid
+from sds.log_utils import header, section, done
+
+# config.YEARS plus one earlier year (same span as download_acled.py)
+START_DATE = f"{min(YEARS) - 1}-01-01"
+END_DATE = f"{max(YEARS)}-12-31"
 
 
-EVENT_TYPES = ["Battles", "Explosions/Remote violence"]
-START_DATE = "2014-01-01"
-END_DATE = "2024-12-31"
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH = PROJECT_ROOT / "data"
-ACLED_PATH = DATA_PATH / "acled"
-os.makedirs(ACLED_PATH, exist_ok=True)
-
-PW_PATH = PROJECT_ROOT / "passwords.json"
-RAW_CSV = ACLED_PATH / "acled_raw_events.csv"
-
-
-def get_access_token():
-    with open(PW_PATH) as f:
-        pws = json.load(f)
-    response = requests.post(
-        "https://acleddata.com/oauth/token",
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={
-            "username": pws["acled"]["username"],
-            "password": pws["acled"]["pw"],
-            "grant_type": "password",
-            "client_id": "acled",
-        },
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"ACLED auth failed: {response.status_code} {response.text}")
-    print("  Authenticated with ACLED API")
-    return response.json()["access_token"]
-
-
-def fetch_acled_events(access_token, bbox, start_date, end_date,
-                       event_types, limit=5000, pause=1, max_pages=1000):
-    url = "https://acleddata.com/api/acled/read"
-    page = 1
-    all_events = []
-
-    while page <= max_pages:
-        params = {
-            "_format": "json",
-            "limit":   limit,
-            "page":    page,
-            "bbox":    ",".join(map(str, bbox)),
-            "fields":  "event_id_cnty|event_date|event_type|latitude|longitude",
-        }
-        if start_date and end_date:
-            params["event_date"] = f"{start_date}|{end_date}"
-            params["event_date_where"] = "BETWEEN"
-        if event_types:
-            params["event_type"] = "|".join(event_types)
-
-        headers = {"Authorization": f"Bearer {access_token}"}
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code != 200:
-            raise RuntimeError(f"ACLED error {response.status_code}: {response.text}")
-
-        data = response.json().get("data", [])
-        if not data:
-            print(f"  No more data at page {page}. Stopping.")
-            break
-
-        all_events.extend(data)
-        print(f"  Page {page}: {len(data)} events, total: {len(all_events)}")
-
-        if len(data) < limit:
-            break
-        page += 1
-        _time.sleep(pause)
-
-    df = pd.DataFrame(all_events)
-    id_col = next((c for c in df.columns if "event_id" in c), None)
-    if id_col:
-        before = len(df)
-        df = df.drop_duplicates(subset=id_col)
-        print(f"  Deduplicated: {before} → {len(df)} events")
-    return df
-
-
-def step1_download():
-    print("=" * 70)
-    print("STEP 1: Download ACLED events")
-    print("=" * 70)
-
-    if RAW_CSV.exists():
-        print(f"  Already exists: {RAW_CSV.name}")
-        return pd.read_csv(RAW_CSV)
-
-    bbox = [-20, -2, 87, 52]
-    token = get_access_token()
-    df = fetch_acled_events(
-        access_token=token,
-        bbox=bbox,
-        start_date=START_DATE,
-        end_date=END_DATE,
-        event_types=EVENT_TYPES,
-    )
-    print(f"  Total events fetched: {len(df)}")
-
+def load_raw_events():
+    if not ACLED_RAW_EVENTS.exists():
+        raise FileNotFoundError(
+            f"{ACLED_RAW_EVENTS} not found. Run scripts/download/download_acled.py first.")
+    df = pd.read_csv(ACLED_RAW_EVENTS)
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["event_date"] = pd.to_datetime(df["event_date"])
-
-    df.to_csv(RAW_CSV, index=False)
-    print(f"  Cached → {RAW_CSV.name}")
     return df
 
 
 def step2_grid_and_aggregate(df, ttag, ftag, spatial_res, steps_per_day,
                               target_lat, target_lon):
-    print("\n" + "=" * 70)
-    print(f"STEP 2: Grid + aggregate → {ftag}")
-    print("=" * 70)
+    section("Grid events and build rolling counts")
 
-    output_file = ACLED_PATH / f"ACLED_2014-2024_{ftag}.nc"
+    output_file = ACLED_PATH / f"ACLED_{ACLED_YEARS_TAG}_{ftag}.nc"
     if output_file.exists():
         print(f"  Already exists: {output_file.name}")
         return
@@ -166,14 +69,18 @@ def step2_grid_and_aggregate(df, ttag, ftag, spatial_res, steps_per_day,
         right = grid[idx]
         return np.where(np.abs(coord - left) <= np.abs(coord - right), left, right)
 
-    df = df.copy()
+    # keep events inside the grid cells (outer cells extend half a cell beyond
+    # the outermost centres); events further out would otherwise be snapped
+    # onto the edge cells
+    half = spatial_res / 2
+    inside = (
+        (df["latitude"] >= lat_grid.min() - half) & (df["latitude"] <= lat_grid.max() + half) &
+        (df["longitude"] >= lon_grid.min() - half) & (df["longitude"] <= lon_grid.max() + half)
+    )
+    print(f"  Events: {len(df):,} ({int((~inside).sum()):,} outside the grid, dropped)")
+    df = df[inside].copy()
     df["lat_snap"] = snap(df["latitude"].values, lat_grid)
     df["lon_snap"] = snap(df["longitude"].values, lon_grid)
-    df = df[
-        (df["lat_snap"] >= lat_grid.min()) & (df["lat_snap"] <= lat_grid.max()) &
-        (df["lon_snap"] >= lon_grid.min()) & (df["lon_snap"] <= lon_grid.max())
-    ]
-    print(f"  Events within grid: {len(df):,}")
 
     counts = (
         df.groupby(["event_date", "lat_snap", "lon_snap", "event_type"])
@@ -202,12 +109,9 @@ def step2_grid_and_aggregate(df, ttag, ftag, spatial_res, steps_per_day,
                 explosions[t, la, lo] += row.count
 
     total = battles + explosions
-    print(f"  Daily grid built: {shape}")
-    print(f"  Total battles:    {int(battles.sum()):,}")
-    print(f"  Total explosions: {int(explosions.sum()):,}")
+    print(f"  Gridded: {int(battles.sum()):,} battles, {int(explosions.sum()):,} explosions")
 
     AGG_WINDOWS = [30, 180, 365]
-    print(f"  Computing rolling window sums: {AGG_WINDOWS} days + log1p")
 
     acled_vars = {"acled_total_count_log1p": np.log1p(total).astype("float32")}
     for w in AGG_WINDOWS:
@@ -217,17 +121,13 @@ def step2_grid_and_aggregate(df, ttag, ftag, spatial_res, steps_per_day,
         rolled[:w] = cs[:w]
         key = f"acled_total_count_{w}d_sum_log1p"
         acled_vars[key] = np.log1p(rolled).astype("float32")
-        print(f"    {key}: mean={acled_vars[key].mean():.3f}, "
-              f"max={acled_vars[key].max():.2f}")
 
     if steps_per_day == 1:
         time_index = all_dates
     else:
-        freq_map = {4: "6h", 8: "3h"}
-        freq = freq_map[steps_per_day]
+        freq = {c["tag"]: c["rule"] for c in RESOLUTION_CONFIG.values()}[ttag]
         time_index = pd.date_range(start=START_DATE, end=END_DATE, freq=freq)
         time_index = time_index[time_index < pd.Timestamp(END_DATE) + pd.Timedelta(days=1)]
-        print(f"  Broadcasting to {steps_per_day} sub-daily steps ({freq})")
         for k in acled_vars:
             acled_vars[k] = np.repeat(acled_vars[k], steps_per_day, axis=0)[:len(time_index)]
 
@@ -252,39 +152,34 @@ def step2_grid_and_aggregate(df, ttag, ftag, spatial_res, steps_per_day,
             ds[vname].attrs["temporal_note"] = "Daily value repeated at each sub-daily timestep"
 
     encoding = {v: {"zlib": True, "complevel": 4, "dtype": "float32"} for v in ds.data_vars}
-    print(f"\n  Saving {output_file.name} ...")
+    print(f"  Saving: {output_file.name}")
     ds.to_netcdf(output_file, engine="h5netcdf", encoding=encoding)
-    size_mb = output_file.stat().st_size / (1024 * 1024)
-    print(f"  Done — {output_file.name} ({size_mb:.1f} MB)")
 
 
-def run_acled_preprocessing(resolution="1D", spatial_res=0.25):
+def run_acled_preprocessing(resolution=RESOLUTION, spatial_res=SPATIAL_RES):
     cfg  = RESOLUTION_CONFIG[resolution]
     ttag = cfg["tag"]
     spd  = cfg["steps_per_day"]
-    ftag = file_tag(ttag, spatial_res)
+    ftag = file_tag(resolution, spatial_res)
     target_lat, target_lon = make_target_grid(spatial_res)
 
-    print(f"\n{'#' * 70}")
-    print(f"  ACLED preprocessing")
-    print(f"  Temporal: {resolution} ({ttag})  |  Spatial: {spatial_res}°")
-    print(f"  File tag: {ftag}  |  Grid: {len(target_lat)}×{len(target_lon)}")
-    print(f"{'#' * 70}\n")
+    header("ACLED preprocessing", {
+        "Resolution": f"{resolution}, {spatial_res}°",
+        "Grid": f"{len(target_lat)} × {len(target_lon)}",
+        "Period": f"{START_DATE} to {END_DATE}",
+    })
 
-    df = step1_download()
-    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
-    df["event_date"] = pd.to_datetime(df["event_date"])
+    df = load_raw_events()
 
     step2_grid_and_aggregate(df, ttag, ftag, spatial_res, spd, target_lat, target_lon)
-    print(f"\nDone: ACLED_2014-2024_{ftag}.nc")
+    done(ACLED_PATH / f"ACLED_{ACLED_YEARS_TAG}_{ftag}.nc")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess ACLED conflict data.")
     parser.add_argument("-r", "--resolution", choices=list(RESOLUTION_CONFIG.keys()),
-                        default="1D", help="Temporal resolution (default: 1D)")
-    parser.add_argument("-s", "--spatial", type=float, choices=[0.25, 0.75],
-                        default=0.25, help="Spatial resolution in degrees (default: 0.25)")
+                        default=RESOLUTION, help=f"Temporal resolution (default: {RESOLUTION})")
+    parser.add_argument("-s", "--spatial", type=float, choices=SUPPORTED_SPATIAL_RES,
+                        default=SPATIAL_RES, help=f"Spatial resolution in degrees (default: {SPATIAL_RES})")
     args = parser.parse_args()
     run_acled_preprocessing(args.resolution, args.spatial)

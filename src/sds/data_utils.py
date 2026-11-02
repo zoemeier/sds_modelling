@@ -19,12 +19,18 @@ from sklearn.metrics import (
     precision_recall_curve, precision_score, recall_score, roc_auc_score,
 )
 
-from config import (
-    OUT_PATH,
-    file_tag, should_drop_feature,
-    LAND_MASK_FILE, LSM_THRESHOLD,
-)
+from sds.config import OUT_PATH, LAND_MASK_FILE, LSM_THRESHOLD, FEATURE_DROP_STEMS
+from sds.paths import file_tag
+from sds.log_utils import section
 
+
+
+def should_drop_feature(varname: str) -> bool:
+    """True if varname is a FEATURE_DROP_STEMS entry or one of its lags / rolling stats."""
+    for stem in FEATURE_DROP_STEMS:
+        if varname == stem or varname.startswith(stem + "_"):
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Feature Cache
@@ -62,9 +68,7 @@ class FeatureCache:
         self._load_all()
 
     def _load_all(self):
-        self.logger.info("=" * 60)
-        self.logger.info("LOADING ALL FEATURES INTO MEMORY")
-        self.logger.info("=" * 60)
+        section("Load features", out=self.logger.info)
 
         total_bytes = 0   # only for tracking memory purposes
         META_VARS = {"lat", "lon", "valid_time",
@@ -76,7 +80,6 @@ class FeatureCache:
                 self.logger.error(f"  Feature file missing: {feat_file}")
                 raise FileNotFoundError(feat_file)
 
-            self.logger.info(f"  Loading {year} ...")
             ds = xr.open_dataset(feat_file).load()
 
             # discover feature list from the first year - subsequent years are
@@ -86,7 +89,6 @@ class FeatureCache:
                     v for v in ds.data_vars
                     if v not in META_VARS and not should_drop_feature(v)
                 ]
-                self.logger.info(f"  Features: {len(self.feature_vars)}")
 
             n = ds.sizes["sample"]
 
@@ -97,7 +99,6 @@ class FeatureCache:
             # n_land is derived once from the first year and trusted thereafter
             if self.n_land is None:
                 self.n_land = n // len(self.unique_times[year])
-                self.logger.info(f"  Land cells per timestep: {self.n_land:,}")
 
             # stack features into a dense float32 array
             X = np.empty((n, len(self.feature_vars)), dtype=np.float32)
@@ -108,8 +109,7 @@ class FeatureCache:
             mask = np.all(np.isfinite(X), axis=1)
             n_nan = int((~mask).sum())
             self.finite_mask[year] = mask
-            if n_nan > 0:
-                self.logger.info(f"    {n_nan:,} NaN rows flagged")
+            self.logger.info(f"  {year}: {n:,} samples ({n_nan:,} with NaN)")
 
             self.X[year] = X
             self.n_samples[year] = n
@@ -121,9 +121,8 @@ class FeatureCache:
 
         total_gb = total_bytes / (1024**3)
         total_samples = sum(self.n_samples.values())
-        self.logger.info(f"\n  Total: {total_samples:,} samples, "
-                         f"{len(self.all_years)} years, {total_gb:.1f} GB")
-        self.logger.info("=" * 60)
+        self.logger.info(f"  Total: {total_samples:,} samples, {len(self.feature_vars)} features, "
+                         f"{total_gb:.1f} GB")
 
 
 # ---------------------------------------------------------------------------
@@ -132,38 +131,38 @@ class FeatureCache:
 
 def load_sds_source(sds_file, logger):
     """Load SDS source file into memory. Returns (ds, var_name)."""
-    logger.info(f"  Loading SDS source: {sds_file.name}")
-    ds = xr.open_dataset(sds_file)
-    # normalise the variety of dim/coord names that show up in different sources
-    for old, new in [("valid_time", "time"), ("lat", "latitude"),
-                     ("lon", "longitude")]:
-        if old in ds.dims and new not in ds.dims:
-            ds = ds.rename({old: new})
-        if old in ds.coords and new not in ds.coords:
-            ds = ds.rename({old: new})
-    ds = ds.load()
+    ds = xr.open_dataset(sds_file).load()
     sds_var = "SDS_SOURCE"
-    logger.info(f"  SDS var: {sds_var}, times: {len(ds.time)}")
     return ds, sds_var
+
+
+def load_land_mask(lat, lon):
+    """2D land mask (True = land) on the (lat, lon) grid."""
+    lsm_ds = xr.open_dataset(LAND_MASK_FILE, engine="cfgrib").squeeze()
+    # resample the land mask onto the grid by nearest neighbour
+    lsm = lsm_ds["lsm"].sel(latitude=lat, longitude=lon, method="nearest")
+    mask_2d = (lsm.values > LSM_THRESHOLD).astype(bool)
+    lsm_ds.close()
+    return mask_2d
 
 
 def compute_land_indices(sds_lat, sds_lon):
     """Compute land cell indices in the ravelled (lat, lon) grid."""
-    # try the NetCDF version first (no cfgrib dependency), fall back to GRIB
-    lsm_nc = LAND_MASK_FILE.with_suffix(".nc")
-    if lsm_nc.exists():
-        lsm_ds = xr.open_dataset(lsm_nc).squeeze()
-    else:
-        lsm_ds = xr.open_dataset(LAND_MASK_FILE, engine="cfgrib").squeeze()
-    lsm_var = next((v for v in ("lsm", "land_sea_mask", "LSM") if v in lsm_ds),
-                   list(lsm_ds.data_vars)[0])
-    # resample the land mask onto the SDS grid by nearest neighbour
-    lsm = lsm_ds[lsm_var].sel(
-        latitude=sds_lat, longitude=sds_lon, method="nearest",
-    )
-    mask_2d = (lsm.values > LSM_THRESHOLD).astype(bool)
-    lsm_ds.close()
-    return np.where(mask_2d.ravel())[0]
+    return np.where(load_land_mask(sds_lat, sds_lon).ravel())[0]
+
+
+def make_stype_for_year(year, ds_sds, unique_times, land_indices):
+    """
+    Source type per sample for one year (1 = genesis, 2 = intermediate, 0 = neither),
+    in the same order as make_target_for_year, so stype[k] aligns with y[k] and
+    cache.X[year][k].
+    """
+    yr_start, yr_end = f"{year}-01-01", f"{year}-12-31"
+    sds_yr = ds_sds.sel(time=slice(yr_start, yr_end))
+    sds_yr = sds_yr.reindex(time=unique_times, fill_value=0)
+    vals = sds_yr["source_type"].values.astype(np.uint8)
+    parts = [vals[ti].ravel()[land_indices] for ti in range(vals.shape[0])]
+    return np.concatenate(parts)
 
 
 def make_target_for_year(year, ds_sds, sds_var, unique_times, land_indices):
@@ -189,12 +188,13 @@ def make_target_for_year(year, ds_sds, sds_var, unique_times, land_indices):
 # Index collection & extraction
 # ---------------------------------------------------------------------------
 
-def collect_indices(cache, years, ds_sds, sds_var, land_indices, logger):
+def collect_indices(cache, years, ds_sds, sds_var, land_indices, logger, label="Samples"):
     """
     Scan years, return lists of (year, idx_in_year) for pos and neg samples.
     Pure function - does not modify the cache.
     """
     all_pos, all_neg = [], []
+    n_dropped = 0
     for year in years:
         if year not in cache.X:
             continue
@@ -210,15 +210,15 @@ def collect_indices(cache, years, ds_sds, sds_var, land_indices, logger):
         y_valid = y[valid_idx]
         pos_idx = valid_idx[y_valid == 1]
         neg_idx = valid_idx[y_valid == 0]
-        logger.info(f"  {year}: {len(pos_idx):,} pos, {len(neg_idx):,} neg "
-                     f"(dropped {int((~valid).sum()):,} NaN)")
+        n_dropped += int((~valid).sum())
         for idx in pos_idx:
             all_pos.append((year, int(idx)))
         for idx in neg_idx:
             all_neg.append((year, int(idx)))
         del y, valid, y_valid
         gc.collect()
-    logger.info(f"  Total: {len(all_pos):,} pos, {len(all_neg):,} neg")
+    logger.info(f"  {label} pool: {len(all_pos):,} pos, {len(all_neg):,} neg "
+                f"({n_dropped:,} NaN rows dropped)")
     return all_pos, all_neg
 
 
@@ -251,7 +251,7 @@ def build_train_set(cache, train_pos, train_neg, sampling_cfg, logger):
     """
     Build X_train, y_train from pre-collected pos/neg index lists.
 
-    Two modes controlled by SamplingConfig:
+    Two modes, set by the sampling dict (config.py, section 5):
       - num_train_total_cap > 0: fixed total budget, derive
             n_pos = total / (1 + ratio), n_neg = total - n_pos
       - num_train_total_cap == 0: cap positives at num_train_pos_cap,
@@ -259,14 +259,14 @@ def build_train_set(cache, train_pos, train_neg, sampling_cfg, logger):
 
     Returns (X_train, y_train, n_pos_used).
     """
-    rng = np.random.default_rng(sampling_cfg.seed)
+    rng = np.random.default_rng(sampling_cfg['seed'])
     n_total_pos = len(train_pos)
     n_total_neg = len(train_neg)
 
-    if sampling_cfg.num_train_total_cap > 0:
+    if sampling_cfg['num_train_total_cap'] > 0:
         # ── Fixed total budget mode ───────────────────────────────────
-        total = sampling_cfg.num_train_total_cap
-        ratio = sampling_cfg.neg_ratio
+        total = sampling_cfg['num_train_total_cap']
+        ratio = sampling_cfg['neg_ratio']
         n_pos = total // (1 + ratio)
         n_neg = total - n_pos
 
@@ -274,19 +274,16 @@ def build_train_set(cache, train_pos, train_neg, sampling_cfg, logger):
         n_pos = min(n_pos, n_total_pos)
         n_neg = min(n_neg, n_total_neg)
 
-        logger.info(f"  Train (total_cap={total:,}): "
-                    f"{n_pos:,} pos / {n_neg:,} neg (1:{ratio})")
+        logger.info(f"  Train set: {n_pos:,} pos, {n_neg:,} neg (1:{ratio}, total cap {total:,})")
     else:
         # ── Pos-cap mode (0 = no cap, use all) ───────────────────────
-        if sampling_cfg.num_train_pos_cap > 0:
-            n_pos = min(n_total_pos, sampling_cfg.num_train_pos_cap)
+        if sampling_cfg['num_train_pos_cap'] > 0:
+            n_pos = min(n_total_pos, sampling_cfg['num_train_pos_cap'])
         else:
             n_pos = n_total_pos
-        n_neg = min(n_pos * sampling_cfg.neg_ratio, n_total_neg)
+        n_neg = min(n_pos * sampling_cfg['neg_ratio'], n_total_neg)
 
-        logger.info(f"  Train (pos_cap={sampling_cfg.num_train_pos_cap}): "
-                    f"{n_pos:,} pos / {n_neg:,} neg "
-                    f"(1:{sampling_cfg.neg_ratio})")
+        logger.info(f"  Train set: {n_pos:,} pos, {n_neg:,} neg (1:{sampling_cfg['neg_ratio']})")
 
     # positive subsample (skip the choice call if we're taking everything)
     if n_total_pos > n_pos:
@@ -314,10 +311,10 @@ def build_eval_set(cache, pos_list, neg_list, sampling_cfg, rng, logger,
                    split_name="eval"):
     """
     Build X, y for a val or test split with proportional sampling,
-    capped at sampling_cfg.val_test_total_cap. Preserves the original pos:neg
+    capped at sampling_cfg['val_test_total_cap']. Preserves the original pos:neg
     ratio of the pool (unlike build_train_set which lets you impose a ratio).
     """
-    cap = sampling_cfg.val_test_total_cap
+    cap = sampling_cfg['val_test_total_cap']
     total = len(pos_list) + len(neg_list)
 
     if cap > 0 and total > cap:
@@ -338,8 +335,8 @@ def build_eval_set(cache, pos_list, neg_list, sampling_cfg, rng, logger,
     y = np.concatenate([np.ones(len(p_keep), np.float32),
                         np.zeros(len(n_keep), np.float32)])
 
-    logger.info(f"  {split_name}: {len(p_keep):,} pos / {len(n_keep):,} neg "
-                f"({len(p_keep)/len(y)*100:.3f}% prevalence)")
+    logger.info(f"  {split_name} set: {len(p_keep):,} pos, {len(n_keep):,} neg "
+                f"({len(p_keep)/len(y)*100:.2f}% pos)")
     return X, y
 
 

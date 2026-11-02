@@ -10,19 +10,17 @@ Output:
 
 import os
 import time
-from pathlib import Path
 
 import xarray as xr
 import rioxarray  # noqa: F401
 from owslib.wcs import WebCoverageService
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH = PROJECT_ROOT / "data"
-SOIL_PATH = DATA_PATH / "soil"
+from sds.config import DOMAIN, SOIL_PATH
+from sds.log_utils import header, section, done
 os.makedirs(SOIL_PATH, exist_ok=True)
 
-BBOX = (-18, 0, 85, 50)              # lon_min, lat_min, lon_max, lat_max in EPSG:4326
+BBOX = (DOMAIN["west"], DOMAIN["south"], DOMAIN["east"], DOMAIN["north"])   # lon/lat min/max, EPSG:4326
 PROPERTIES = ["sand", "silt", "clay", "bdod", "soc", "cec"]
 DEPTHS = ["0-5cm"]
 QUANTILE = "mean"
@@ -51,20 +49,19 @@ def download_layer(prop, depth, quantile):
     output_file = SOIL_PATH / f"{coverage_id}.tif"
 
     if output_file.exists():
-        print(f"  Already exists, skipping: {output_file}")
+        print(f"  Already exists: {output_file.name}")
         return output_file
 
     url = f"https://maps.isric.org/mapserv?map=/map/{prop}.map"
 
-    print(f"  Connecting to WCS: {prop} ...")
     wcs = WebCoverageService(url, version=WCS_VERSION)
 
     available = list(wcs.contents)
     if coverage_id not in available:
-        print(f"  WARNING: '{coverage_id}' not found. Available: {available[:6]}...")
+        print(f"  WARNING: '{coverage_id}' not offered by the WCS (available: {available[:6]} ...)")
         return None
 
-    print(f"  Requesting: {coverage_id}  bbox={BBOX}  res={RESOLUTION}° ...")
+    print(f"  Requesting: {coverage_id}")
     response = wcs.getCoverage(
         identifier=coverage_id,
         crs=CRS,
@@ -77,27 +74,18 @@ def download_layer(prop, depth, quantile):
     with open(output_file, "wb") as f:
         f.write(response.read())
 
-    size_mb = output_file.stat().st_size / (1024 * 1024)
-    print(f"  Saved: {output_file} ({size_mb:.1f} MB)")
+    print(f"  Saved: {output_file.name}")
     return output_file
 
 
 def download_all():
-    print("=" * 60)
-    print("Step 1: Download SoilGrids data via WCS")
-    print(f"  Properties : {PROPERTIES}")
-    print(f"  Depths     : {DEPTHS}")
-    print(f"  Statistic  : {QUANTILE}")
-    print(f"  BBox       : lon [{BBOX[0]}, {BBOX[2]}], lat [{BBOX[1]}, {BBOX[3]}]")
-    print(f"  Resolution : {RESOLUTION}° (~{RESOLUTION * 111:.0f} km)")
-    print("=" * 60)
+    section("Step 1: Download GeoTIFFs (WCS)")
 
     total = len(PROPERTIES) * len(DEPTHS)
     count = 0
     for prop in PROPERTIES:
         for depth in DEPTHS:
             count += 1
-            print(f"\n[{count}/{total}] {prop} — {depth}")
             try:
                 download_layer(prop, depth, QUANTILE)
             except Exception as e:
@@ -105,7 +93,6 @@ def download_all():
             if count < total:
                 time.sleep(PAUSE)
 
-    print(f"\nDownload complete. Files in: {SOIL_PATH}")
 
 
 def read_tiff(prop, depth):
@@ -126,9 +113,7 @@ def read_tiff(prop, depth):
 
 def convert_to_netcdf():
     """Combine downloaded GeoTIFFs into one NetCDF with unit conversions."""
-    print("\n" + "=" * 60)
-    print("Step 2: Convert GeoTIFFs → NetCDF with unit conversions")
-    print("=" * 60)
+    section("Step 2: Combine GeoTIFFs into one NetCDF")
 
     if NETCDF_INTERMEDIATE.exists():
         print(f"  Already exists: {NETCDF_INTERMEDIATE.name}")
@@ -137,7 +122,6 @@ def convert_to_netcdf():
     data = {prop: [] for prop in PROPERTIES}
     for depth in DEPTHS:
         for prop in PROPERTIES:
-            print(f"  Reading {prop}_{depth}_{QUANTILE}.tif")
             data[prop].append(read_tiff(prop, depth))
 
     arrays = {}
@@ -149,7 +133,6 @@ def convert_to_netcdf():
         stacked.attrs["units"] = conv["units"]
         stacked.attrs["long_name"] = conv["long_name"]
         arrays[prop] = stacked
-        print(f"  {prop}: ÷{conv['factor']} → {conv['units']}")
 
     fine_fraction = arrays["silt"] + arrays["clay"]
     fine_fraction.attrs = {"units": "%", "long_name": "fine fraction (silt + clay)"}
@@ -178,29 +161,24 @@ def convert_to_netcdf():
         "sand_to_fines dimensionless."
     )
 
-    print("\nSanity checks:")
     texture_sum = ds["sand"] + ds["silt"] + ds["clay"]
-    print(f"  sand+silt+clay: min={float(texture_sum.min(skipna=True)):.1f}  "
-          f"max={float(texture_sum.max(skipna=True)):.1f}  "
-          f"mean={float(texture_sum.mean(skipna=True)):.1f}  (expect ~100)")
-    for v in PROPERTIES:
-        vmin = float(ds[v].min(skipna=True))
-        vmax = float(ds[v].max(skipna=True))
-        vmean = float(ds[v].mean(skipna=True))
-        print(f"  {v:6s}: min={vmin:8.2f}  max={vmax:8.2f}  mean={vmean:8.2f}  [{CONVERSIONS[v]['units']}]")
+    print(f"  Check: sand + silt + clay = {float(texture_sum.mean(skipna=True)):.1f}% on average (expect ~100)")
 
     encoding = {var: {"zlib": True, "complevel": 4, "dtype": "float32"} for var in ds.data_vars}
-    print(f"\nWriting {NETCDF_INTERMEDIATE} ...")
+    print(f"  Saving: {NETCDF_INTERMEDIATE.name}")
     ds.to_netcdf(NETCDF_INTERMEDIATE, encoding=encoding)
-    size_mb = NETCDF_INTERMEDIATE.stat().st_size / (1024 * 1024)
-    print(f"Done — {NETCDF_INTERMEDIATE} ({size_mb:.1f} MB)")
     return ds
 
 
 def run_soil_download():
+    header("SoilGrids download", {
+        "Properties": ", ".join(PROPERTIES),
+        "Depth": ", ".join(DEPTHS),
+        "Resolution": f"{RESOLUTION}°",
+    })
     download_all()
     convert_to_netcdf()
-    print(f"\nDone. Intermediate file: {NETCDF_INTERMEDIATE}")
+    done(NETCDF_INTERMEDIATE)
 
 
 if __name__ == "__main__":

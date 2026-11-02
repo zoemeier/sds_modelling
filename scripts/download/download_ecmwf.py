@@ -1,13 +1,13 @@
 """
 Request ERA5 and CAMS reanalysis data from the Copernicus CDS/ADS APIs,
-year by year (2015-2024).
+year by year (config.YEARS).
 
 ERA5 dynamic variables (per year):
-    tp, dt2m, t2m, u10, v10, soil_type, i10fg, blh, swvl1, cape, lai_lv, lai_hv
+    tp, dt2m, t2m, u10, v10, lai_lv, lai_hv
 ERA5 static variables (single time step):
-    z, sdor, slor, anor, isor, cvl, cvh, land_sea_mask
+    sdor, slor, anor, isor, cvl, cvh, land_sea_mask
 CAMS variables (per year):
-    u10, v10, daod550, pm10, aod469, aod550, aod865
+    duaod550, pm10, aod469, aod865
 
 Output:
     ERA5: data/era5/ERA5_<short>_<year>.grib   (hourly)
@@ -22,21 +22,20 @@ Notes:
     exist on disk are skipped.
 """
 
-from pathlib import Path
 import os
 import json
 
 import cdsapi
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_PATH = PROJECT_ROOT / "data"
-ERA5_PATH = DATA_PATH / "era5"
-CAMS_PATH = DATA_PATH / "cams"
+from sds.config import (
+    DOMAIN, ERA5_PATH, CAMS_PATH, LAND_MASK_FILE,
+    YEARS, PASSWORDS_FILE as PW_PATH,
+)
+from sds.log_utils import header, section, done
 os.makedirs(ERA5_PATH, exist_ok=True)
 os.makedirs(CAMS_PATH, exist_ok=True)
 
-PW_PATH = PROJECT_ROOT / "passwords.json"
 with open(PW_PATH) as f:
     pws = json.load(f)
 
@@ -57,17 +56,11 @@ era5_variables = {
     "2m_temperature":                            "t2m",
     "10m_u_component_of_wind":                   "u10",
     "10m_v_component_of_wind":                   "v10",
-    "soil_type":                                 "soil",
-    "instantaneous_10m_wind_gust":               "i10fg",
-    "boundary_layer_height":                     "blh",
-    "volumetric_soil_water_layer_1":             "swvl1",
-    "convective_available_potential_energy":     "cape",
     "leaf_area_index_low_vegetation":            "lai_lv",
     "leaf_area_index_high_vegetation":           "lai_hv",
 }
 
 era5_static_variables = {
-    "geopotential":                              "z",
     "standard_deviation_of_orography":           "sdor",
     "slope_of_sub_gridscale_orography":          "slor",
     "anisotropy_of_sub_gridscale_orography":     "anor",
@@ -76,19 +69,27 @@ era5_static_variables = {
     "high_vegetation_cover":                     "cvh",
 }
 
-ERA5_AREA = [50, -18, 0, 85]
-CAMS_AREA = [50.25, -18, 0, 85]
+# CDS/ADS area = [north, west, south, east]; CAMS gets 0.25° extra in the north
+# so the 0.75° grid is fully covered
+ERA5_AREA = [DOMAIN["north"], DOMAIN["west"], DOMAIN["south"], DOMAIN["east"]]
+CAMS_AREA = [DOMAIN["north"] + 0.25, DOMAIN["west"], DOMAIN["south"], DOMAIN["east"]]
 
+
+header("ERA5 + CAMS download", {
+    "Years": f"{min(YEARS)}-{max(YEARS)}",
+    "Domain": f"{DOMAIN['south']}-{DOMAIN['north']}°N, {DOMAIN['west']}-{DOMAIN['east']}°E",
+})
 
 # ERA5 dynamic variables, year by year
+section("ERA5 hourly")
 for var, short in era5_variables.items():
-    for year in range(2015, 2025):
+    for year in YEARS:
         filename = ERA5_PATH / f"ERA5_{short}_{year}.grib"
         if filename.exists():
             print(f"  Already exists: {filename.name}")
             continue
 
-        print(f"Submitting ERA5 request: {var} {year}")
+        print(f"  Requesting: {filename.name}")
         cds_client.retrieve(
             "reanalysis-era5-single-levels",
             {
@@ -103,17 +104,18 @@ for var, short in era5_variables.items():
             },
             target=str(filename),
         )
-        print(f"Downloaded ERA5 {var} {year}")
+        print(f"  Saved: {filename.name}")
 
 
 # ERA5 static variables (single time step)
+section("ERA5 static")
 for var, short in era5_static_variables.items():
     filename = ERA5_PATH / f"ERA5_{short}_static.grib"
     if filename.exists():
         print(f"  Already exists: {filename.name}")
         continue
 
-    print(f"Submitting ERA5 static request: {var}")
+    print(f"  Requesting: {filename.name}")
     cds_client.retrieve(
         "reanalysis-era5-single-levels",
         {
@@ -129,53 +131,48 @@ for var, short in era5_static_variables.items():
         },
         target=str(filename),
     )
-    print(f"Downloaded ERA5 static {var}")
+    print(f"  Saved: {filename.name}")
 
 
 # CAMS, year by year
 cams_variables = [
-    "10m_u_component_of_wind",
-    "10m_v_component_of_wind",
     "dust_aerosol_optical_depth_550nm",
     "particulate_matter_10um",
     "total_aerosol_optical_depth_469nm",
-    "total_aerosol_optical_depth_550nm",
     "total_aerosol_optical_depth_865nm",
 ]
-cams_periods = {
-    "2015-2019": range(2015, 2020),
-    "2020-2024": range(2020, 2025),
-}
+section("CAMS 3-hourly")
+for year in YEARS:
+    filename = CAMS_PATH / f"CAMS_{year}.nc"
+    if filename.exists():
+        print(f"  Already exists: {filename.name}")
+        continue
 
-for period, years in cams_periods.items():
-    for year in years:
-        filename = CAMS_PATH / f"CAMS_{year}.nc"
-        if filename.exists():
-            print(f"  Already exists: {filename.name}")
-            continue
-
-        print(f"Submitting CAMS request for {year} -> {filename}")
-        ads_client.retrieve(
-            "cams-global-reanalysis-eac4",
-            {
-                "date": [f"{year}-01-01/{year}-12-31"],
-                "time": [
-                    "00:00", "03:00", "06:00",
-                    "09:00", "12:00", "15:00",
-                    "18:00", "21:00",
-                ],
-                "format": "netcdf",
-                "variable": cams_variables,
-                "area": CAMS_AREA,
-            }
-        ).download(filename)
-        print(f"Downloaded CAMS {year}")
+    print(f"  Requesting: {filename.name}")
+    ads_client.retrieve(
+        "cams-global-reanalysis-eac4",
+        {
+            "date": [f"{year}-01-01/{year}-12-31"],
+            "time": [
+                "00:00", "03:00", "06:00",
+                "09:00", "12:00", "15:00",
+                "18:00", "21:00",
+            ],
+            "format": "netcdf",
+            "variable": cams_variables,
+            "area": CAMS_AREA,
+        }
+    ).download(filename)
+    print(f"  Saved: {filename.name}")
 
 
 # Land-sea mask (single time step)
-filename = ERA5_PATH / "ERA5_land_sea_mask_2020.grib"
-if not filename.exists():
-    print("Submitting ERA5 request: Land Sea Mask 2020")
+section("ERA5 land-sea mask")
+filename = LAND_MASK_FILE
+if filename.exists():
+    print(f"  Already exists: {filename.name}")
+else:
+    print(f"  Requesting: {filename.name}")
     cds_client.retrieve(
         "reanalysis-era5-single-levels",
         {
@@ -191,4 +188,6 @@ if not filename.exists():
         },
         target=str(filename),
     )
-    print("Downloaded ERA5 Land Sea Mask 2020")
+    print(f"  Saved: {filename.name}")
+
+done()

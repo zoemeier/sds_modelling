@@ -15,19 +15,20 @@ import gc
 import logging
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
-from config import (
-    LOGS_PATH, RF_PARAMS, SUBSAMPLE_SWEEP,
-    RESOLUTION, SPATIAL_RES, TRAIN_YEARS, VAL_YEARS, TEST_YEARS,
-    SDS_PATH, SWEEP_RATIOS, SWEEP_CLASS_WEIGHTS,
+from sds.config import (
+    VAL_CALIB_FRAC, VAL_SPLIT_SEED, LOGS_PATH, RF_PARAMS,
+    SWEEP_SAMPLING, RESOLUTION, SPATIAL_RES, TRAIN_YEARS,
+    VAL_YEARS, TEST_YEARS, SWEEP_RATIOS, SWEEP_CLASS_WEIGHTS,
 )
-from data_utils import (
+from sds.paths import project_relative, resolve_path, SDS_PATH
+from sds.log_utils import header, section, done
+from sds.data_utils import (
     FeatureCache, load_sds_source, compute_land_indices,
     collect_indices, build_train_set, build_eval_set,
     platt_fit, platt_apply, compute_metrics, find_best_threshold,
@@ -60,13 +61,13 @@ def main():
     # Sampling overrides
     parser.add_argument("--total_cap", type=int, default=None,
                         help=f"Override num_train_total_cap "
-                             f"(default: {SUBSAMPLE_SWEEP.num_train_total_cap})")
+                             f"(default: {SWEEP_SAMPLING['num_train_total_cap']})")
     parser.add_argument("--val_test_cap", type=int, default=None,
                         help=f"Override val_test_total_cap "
-                             f"(default: {SUBSAMPLE_SWEEP.val_test_total_cap})")
+                             f"(default: {SWEEP_SAMPLING['val_test_total_cap']})")
     parser.add_argument("--seed", type=int, default=None,
                         help=f"Override seed "
-                             f"(default: {SUBSAMPLE_SWEEP.seed})")
+                             f"(default: {SWEEP_SAMPLING['seed']})")
 
     # Sweep settings
     parser.add_argument("--ratios", nargs="+", type=int, default=None,
@@ -87,7 +88,7 @@ def main():
     train_years = args.train_years or TRAIN_YEARS
     val_years   = args.val_years or VAL_YEARS
     test_years  = args.test_years or TEST_YEARS
-    sds_path    = args.sds_path or SDS_PATH
+    sds_path    = resolve_path(args.sds_path or SDS_PATH)
     ratios      = args.ratios or SWEEP_RATIOS
 
     # Resolve class weight options
@@ -99,7 +100,7 @@ def main():
         use_class_weights = SWEEP_CLASS_WEIGHTS
 
     # Build sampling config with overrides
-    base_cfg = SUBSAMPLE_SWEEP
+    base_cfg = SWEEP_SAMPLING
     overrides = {}
     if args.total_cap is not None:
         overrides["num_train_total_cap"] = args.total_cap
@@ -108,17 +109,11 @@ def main():
     if args.seed is not None:
         overrides["seed"] = args.seed
     if overrides:
-        base_cfg = replace(base_cfg, **overrides)
+        base_cfg = {**base_cfg, **overrides}
 
-    # Validate SDS path
-    if sds_path is None:
-        print("ERROR: No SDS path provided. Set SDS_PATH in config.py "
-              "or pass --sds_path on the command line.")
-        sys.exit(1)
     sds_file = Path(sds_path)
     if not sds_file.exists():
-        print(f"ERROR: SDS file not found: {sds_file}")
-        sys.exit(1)
+        sys.exit(f"ERROR: labels not found: {sds_file} (run the backtracking first)")
 
     # ── Logging ───────────────────────────────────────────────────────────
     logging.basicConfig(
@@ -142,20 +137,19 @@ def main():
             for row in reader:
                 results.append(row)
                 done_keys.add((row["ratio"], row["class_weight"]))
-        logger.info(f"  Resuming: {len(results)} experiments already done")
 
-    logger.info("=" * 60)
-    logger.info("SUBSAMPLING RATIO EXPERIMENT")
-    logger.info("=" * 60)
-    logger.info(f"  SDS: {sds_file}")
-    logger.info(f"  Resolution: {resolution}, spatial: {spatial_res}")
-    logger.info(f"  Train: {train_years}, Val: {val_years}, Test: {test_years}")
-    logger.info(f"  Ratios: {ratios}")
-    logger.info(f"  Class weights: {use_class_weights}")
-    logger.info(f"  Train total cap: {base_cfg.num_train_total_cap:,}")
-    logger.info(f"  Val/test cap: {base_cfg.val_test_total_cap:,}")
-    logger.info(f"  Seed: {base_cfg.seed}")
-    logger.info(f"  Output: {out_csv}")
+    header("Subsampling ratio sweep", {
+        "Labels": project_relative(sds_file),
+        "Resolution": f"{resolution}, {spatial_res}°",
+        "Train / val / test": f"{train_years} / {val_years} / {test_years}",
+        "Ratios": ", ".join(f"1:{r}" for r in ratios) + ", natural",
+        "Class weights": ", ".join(str(c) for c in use_class_weights),
+        "Sampling": f"train total cap {base_cfg['num_train_total_cap']:,}, "
+                    f"val/test cap {base_cfg['val_test_total_cap']:,}, seed {base_cfg['seed']}",
+        "Output": project_relative(out_csv),
+    }, out=logger.info)
+    if results:
+        logger.info(f"  Resuming: {len(results)} runs already done")
 
     # ── Load features ─────────────────────────────────────────────────────
     cache = FeatureCache(
@@ -172,33 +166,28 @@ def main():
     land_indices = compute_land_indices(
         ds_sds["latitude"].values, ds_sds["longitude"].values,
     )
-    logger.info(f"  Land cells: {len(land_indices):,}")
 
     # ── Collect all indices ───────────────────────────────────────────────
-    logger.info("\nCollecting TRAIN indices ...")
+    section("Samples", out=logger.info)
     train_pos, train_neg = collect_indices(
-        cache, cache.train_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.train_years, ds_sds, sds_var, land_indices, logger, label="Train")
 
-    logger.info("\nCollecting VAL indices ...")
     val_pos, val_neg = collect_indices(
-        cache, cache.val_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.val_years, ds_sds, sds_var, land_indices, logger, label="Val")
 
-    logger.info("\nCollecting TEST indices ...")
     test_pos, test_neg = collect_indices(
-        cache, cache.test_years, ds_sds, sds_var, land_indices, logger)
+        cache, cache.test_years, ds_sds, sds_var, land_indices, logger, label="Test")
 
     ds_sds.close()
     del ds_sds
     gc.collect()
 
     # ── Build val/test once ───────────────────────────────────────────────
-    rng = np.random.default_rng(base_cfg.seed)
+    rng = np.random.default_rng(base_cfg['seed'])
 
-    logger.info("\nBuilding VAL set ...")
     X_val, y_val = build_eval_set(
         cache, val_pos, val_neg, base_cfg, rng, logger, "Val")
 
-    logger.info("Building TEST set ...")
     X_test, y_test = build_eval_set(
         cache, test_pos, test_neg, base_cfg, rng, logger, "Test")
 
@@ -206,8 +195,7 @@ def main():
     n_total_pos = len(train_pos)
     n_total_neg = len(train_neg)
     true_ratio = n_total_neg / max(n_total_pos, 1)
-    logger.info(f"\n  True class ratio: 1:{true_ratio:.0f} "
-                f"({n_total_pos:,} pos / {n_total_neg:,} neg)")
+    logger.info(f"  Natural train ratio: 1:{true_ratio:.0f}")
 
     # ── Run experiments ───────────────────────────────────────────────────
     # Add "natural" ratio (true class ratio) as a special case
@@ -228,23 +216,17 @@ def main():
             cw_label = "balanced_subsample" if use_cw else "none"
 
             if (ratio_key, cw_label) in done_keys:
-                logger.info(f"\n  Skipping ratio={ratio_key}, "
-                             f"class_weight={cw_label} (already done)")
                 continue
 
             # Build train set with this ratio (fixed total budget)
-            trial_cfg = replace(base_cfg, neg_ratio=ratio)
+            trial_cfg = {**base_cfg, 'neg_ratio': ratio}
 
-            logger.info(f"\n{'='*60}")
-            logger.info(f"RATIO {ratio_label}, class_weight={cw_label}")
-            logger.info(f"{'='*60}")
+            section(f"Ratio {ratio_label}, class_weight={cw_label}", out=logger.info)
 
             t0 = time.time()
             X_train, y_train, n_pos = build_train_set(
                 cache, train_pos, train_neg, trial_cfg, logger)
             n_neg = len(y_train) - n_pos
-            t_extract = time.time() - t0
-            logger.info(f"  Built in {t_extract:.1f}s")
 
             # Train RF
             t0 = time.time()
@@ -257,13 +239,7 @@ def main():
             rf = RandomForestClassifier(**rf_params)
             rf.fit(X_train, y_train)
             t_train = time.time() - t0
-            logger.info(f"  RF trained in {t_train:.1f}s")
-
-            # Top features
-            imp = rf.feature_importances_
-            for rank, i in enumerate(np.argsort(imp)[::-1][:5], 1):
-                logger.info(f"    {rank}. {cache.feature_vars[i]:<30s} "
-                             f"{imp[i]:.4f}")
+            logger.info(f"  Trained in {t_train / 60:.1f} min")
 
             del X_train, y_train
             gc.collect()
@@ -271,11 +247,11 @@ def main():
             # ── Evaluate on val ───────────────────────────────────────────
             unique_val = np.unique(y_val)
             if len(unique_val) < 2:
-                logger.warning("  Val has only one class, skipping")
+                logger.warning("  Val set has only one class (run skipped)")
                 continue
 
             X_cal, X_eval, y_cal, y_eval = train_test_split(
-                X_val, y_val, test_size=0.5, stratify=y_val, random_state=42)
+                X_val, y_val, test_size=VAL_CALIB_FRAC, stratify=y_val, random_state=VAL_SPLIT_SEED)
 
             proba_cal = rf.predict_proba(X_cal)[:, 1]
             platt_lr = platt_fit(y_cal, proba_cal)
@@ -285,7 +261,7 @@ def main():
             thr_cal = find_best_threshold(y_eval, proba_eval_cal)
             val_m = compute_metrics(y_eval, proba_eval_cal, thr_cal)
 
-            logger.info(f"  VAL: F1={val_m['f1']:.4f} "
+            logger.info(f"  Val:  F1={val_m['f1']:.4f} "
                          f"P={val_m['precision']:.4f} "
                          f"R={val_m['recall']:.4f} "
                          f"AUC={val_m['auc']:.4f} "
@@ -305,7 +281,7 @@ def main():
                 test_m = {"f1": 0, "precision": 0, "recall": 0, "auc": 0,
                           "tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
-            logger.info(f"  TEST: F1={test_m['f1']:.4f} "
+            logger.info(f"  Test: F1={test_m['f1']:.4f} "
                          f"P={test_m['precision']:.4f} "
                          f"R={test_m['recall']:.4f} "
                          f"AUC={test_m['auc']:.4f}")
@@ -344,25 +320,12 @@ def main():
             _write_csv(out_csv, results)
 
     # ── Final summary ─────────────────────────────────────────────────────
-    logger.info(f"\n{'='*60}")
-    logger.info("EXPERIMENT COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"  Results: {out_csv}")
-    logger.info(f"  Total experiments: {len(results)}")
-
-    logger.info(f"\n{'Ratio':<12s} {'CW':<20s} {'Pos':>10s} {'Neg':>10s} "
-                 f"{'Total':>10s} {'Val F1':>8s} "
-                 f"{'Val P':>8s} {'Val R':>8s} {'Test F1':>8s} "
-                 f"{'Test P':>8s} {'Test R':>8s} {'Time':>6s}")
-    logger.info("-" * 130)
+    section("Summary", out=logger.info)
+    logger.info(f"  {'Ratio':<16s} {'Class weight':<20s} {'Val F1':>8s} {'Test F1':>8s}")
     for r in results:
-        logger.info(f"{r['ratio_label']:<12s} {r['class_weight']:<20s} "
-                     f"{r['n_pos_train']:>10} {r['n_neg_train']:>10} "
-                     f"{r['n_total_train']:>10} "
-                     f"{r['val_f1']:>8} {r['val_precision']:>8} "
-                     f"{r['val_recall']:>8} {r['test_f1']:>8} "
-                     f"{r['test_precision']:>8} {r['test_recall']:>8} "
-                     f"{r['train_time_s']:>5}s")
+        logger.info(f"  {r['ratio_label']:<16s} {r['class_weight']:<20s} "
+                    f"{float(r['val_f1']):>8.4f} {float(r['test_f1']):>8.4f}")
+    done(out_csv, out=logger.info)
 
 
 def _write_csv(path, rows):
